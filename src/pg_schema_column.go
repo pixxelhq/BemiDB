@@ -376,6 +376,11 @@ func (pgSchemaColumn *PgSchemaColumn) icebergPrimitiveType() string {
 	case "float4", "float8":
 		return "float"
 	case "numeric":
+		if pgSchemaColumn.NumericPrecision == "0" && pgSchemaColumn.NumericScale == "0" {
+			// As per Postgres documentation a numeric type created without any constraints will follow the implementation limits.
+			// Using limits here as per the table - https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-NUMERIC
+			return "decimal(131072, 16383)"
+		}
 		return "decimal(" + pgSchemaColumn.NumericPrecision + ", " + pgSchemaColumn.NumericScale + ")"
 	case "bool":
 		return "boolean"
