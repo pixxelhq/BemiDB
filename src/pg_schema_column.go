@@ -190,6 +190,12 @@ func (pgSchemaColumn *PgSchemaColumn) toParquetSchemaField() ParquetSchemaField 
 			precision = PARQUET_MAX_PRECISION
 		}
 
+		if precision == 0 && scale == 0 {
+			// As per Postgres documentation a numeric type created without any constraints will follow the implementation limits.
+			// Using limits here as per the table - https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-NUMERIC
+			precision = PARQUET_MAX_PRECISION
+			scale = 2
+		}
 		parquetSchemaField.Scale = IntToString(scale)
 		parquetSchemaField.Precision = IntToString(precision)
 		parquetSchemaField.Length = IntToString(scale + precision)
@@ -379,7 +385,7 @@ func (pgSchemaColumn *PgSchemaColumn) icebergPrimitiveType() string {
 		if pgSchemaColumn.NumericPrecision == "0" && pgSchemaColumn.NumericScale == "0" {
 			// As per Postgres documentation a numeric type created without any constraints will follow the implementation limits.
 			// Using limits here as per the table - https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-NUMERIC
-			return "decimal(131072, 16383)"
+			return "decimal(38, 2)"
 		}
 		return "decimal(" + pgSchemaColumn.NumericPrecision + ", " + pgSchemaColumn.NumericScale + ")"
 	case "bool":
