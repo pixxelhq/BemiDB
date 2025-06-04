@@ -116,7 +116,7 @@ func registerFlags() {
 	flag.BoolVar(&_config.Pg.PreserveUnsynced, "pg-preserve-unsynced", os.Getenv(ENV_PG_PRESERVE_UNSYNCED) == "true", "(Optional) Do not delete the existing tables in BemiDB that are not part of the sync")
 	flag.StringVar(&_config.Pg.DatabaseUrl, "pg-database-url", os.Getenv(ENV_PG_DATABASE_URL), "PostgreSQL database URL to sync")
 	flag.StringVar(&_config.Aws.Region, "aws-region", os.Getenv(ENV_AWS_REGION), "AWS region")
-	flag.StringVar(&_config.Aws.S3Endpoint, "aws-s3-endpoint", os.Getenv(ENV_AWS_S3_ENDPOINT), "AWS S3 endpoint. Default: \""+DEFAULT_AWS_S3_ENDPOINT+"\"")
+	flag.StringVar(&_config.Aws.S3Endpoint, "aws-s3-endpoint", os.Getenv(ENV_AWS_S3_ENDPOINT), "AWS S3 endpoint.")
 	flag.StringVar(&_config.Aws.S3Bucket, "aws-s3-bucket", os.Getenv(ENV_AWS_S3_BUCKET), "AWS S3 bucket name")
 	flag.StringVar(&_config.Aws.AccessKeyId, "aws-access-key-id", os.Getenv(ENV_AWS_ACCESS_KEY_ID), "AWS access key ID")
 	flag.StringVar(&_config.Aws.SecretAccessKey, "aws-secret-access-key", os.Getenv(ENV_AWS_SECRET_ACCESS_KEY), "AWS secret access key")
@@ -164,9 +164,6 @@ func parseFlags() {
 	if _config.StorageType == STORAGE_TYPE_S3 {
 		if _config.Aws.Region == "" {
 			panic("AWS region is required")
-		}
-		if _config.Aws.S3Endpoint == "" {
-			_config.Aws.S3Endpoint = DEFAULT_AWS_S3_ENDPOINT
 		}
 		if _config.Aws.S3Bucket == "" {
 			panic("AWS S3 bucket name is required")

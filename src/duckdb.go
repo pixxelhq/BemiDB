@@ -87,7 +87,7 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 			PanicIfError(config, err)
 		}
 
-		if config.Aws.S3Endpoint != DEFAULT_AWS_S3_ENDPOINT {
+		if config.Aws.S3Endpoint != "" && config.Aws.S3Endpoint != DEFAULT_AWS_S3_ENDPOINT {
 			// Use endpoint/bucket/key (path, deprecated on AWS) instead of bucket.endpoint/key (vhost)
 			_, err = duckdb.ExecContext(ctx, "SET s3_url_style='path'", nil)
 			PanicIfError(config, err)

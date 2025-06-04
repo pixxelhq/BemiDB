@@ -33,10 +33,12 @@ func NewS3Storage(config *Config) *StorageS3 {
 		awsConfigOptions = append(awsConfigOptions, awsConfig.WithClientLogMode(aws.LogRequest))
 	}
 
-	if IsLocalHost(config.Aws.S3Endpoint) {
-		awsConfigOptions = append(awsConfigOptions, awsConfig.WithBaseEndpoint("http://"+config.Aws.S3Endpoint))
-	} else {
-		awsConfigOptions = append(awsConfigOptions, awsConfig.WithBaseEndpoint("https://"+config.Aws.S3Endpoint))
+	if config.Aws.S3Endpoint != "" {
+		if IsLocalHost(config.Aws.S3Endpoint) {
+			awsConfigOptions = append(awsConfigOptions, awsConfig.WithBaseEndpoint("http://"+config.Aws.S3Endpoint))
+		} else {
+			awsConfigOptions = append(awsConfigOptions, awsConfig.WithBaseEndpoint("https://"+config.Aws.S3Endpoint))
+		}
 	}
 
 	if config.Aws.AccessKeyId != "" && config.Aws.SecretAccessKey != "" {
