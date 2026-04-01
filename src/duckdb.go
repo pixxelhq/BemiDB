@@ -23,6 +23,9 @@ var DUCKDB_INIT_BOOT_QUERIES = []string{
 	"INSTALL iceberg",
 	"LOAD iceberg",
 
+	"INSTALL spatial",
+	"LOAD spatial",
+
 	// Set up schemas
 	"SELECT oid FROM pg_catalog.pg_namespace",
 	"CREATE SCHEMA public",
