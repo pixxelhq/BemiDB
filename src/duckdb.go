@@ -76,6 +76,12 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 		PanicIfError(config, err)
 	}
 
+	if config.EnableCache {
+		_, err = duckdb.ExecContext(ctx, "SET enable_object_cache=true", nil)
+		PanicIfError(config, err)
+		LogInfo(config, "DuckDB: Object cache enabled")
+	}
+
 	switch config.StorageType {
 	case STORAGE_TYPE_S3:
 		if duckdb.config.Aws.AccessKeyId != "" && duckdb.config.Aws.SecretAccessKey != "" {
