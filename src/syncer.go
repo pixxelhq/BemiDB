@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -226,6 +228,15 @@ func (syncer *Syncer) newConnection(ctx context.Context, databaseUrl string) *pg
 	PanicIfError(syncer.config, err)
 
 	_, err = conn.Exec(ctx, "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE")
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "0A000" &&
+			(strings.Contains(strings.ToLower(pgErr.Message), "hot standby") || strings.Contains(strings.ToLower(pgErr.Message), "serializable")) {
+			// Hot standby does not support SERIALIZABLE isolation level; fall back to REPEATABLE READ
+			LogWarn(syncer.config, "Hot standby detected, falling back to REPEATABLE READ isolation level")
+			_, err = conn.Exec(ctx, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+		}
+	}
 	PanicIfError(syncer.config, err)
 
 	return conn
