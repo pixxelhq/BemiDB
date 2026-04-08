@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -236,8 +236,8 @@ func (syncer *Syncer) newConnection(ctx context.Context, databaseUrl string) *pg
 			LogWarn(syncer.config, "Hot standby detected, falling back to REPEATABLE READ isolation level")
 			_, err = conn.Exec(ctx, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
 		}
+		PanicIfError(syncer.config, err)
 	}
-	PanicIfError(syncer.config, err)
 
 	return conn
 }
