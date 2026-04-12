@@ -62,7 +62,10 @@ func (syncer *Syncer) SyncFromPostgres() {
 	structureConn := syncer.newConnection(ctx, databaseUrl)
 	defer structureConn.Close(ctx)
 
-	copyConn := syncer.newConnection(ctx, databaseUrl)
+	// Export snapshot from structureConn so all copy connections see the same data
+	snapshotID := syncer.exportSnapshot(ctx, structureConn)
+
+	copyConn := syncer.newConnectionWithSnapshot(ctx, databaseUrl, snapshotID)
 	defer copyConn.Close(ctx)
 
 	syncedPgSchemaTables := []PgSchemaTable{}
@@ -78,7 +81,7 @@ func (syncer *Syncer) SyncFromPostgres() {
 
 				incrementalRefresh := syncer.config.Pg.IncrementallyRefreshedTables != nil && HasExactOrWildcardMatch(syncer.config.Pg.IncrementallyRefreshedTables, pgSchemaTable.ToConfigArg())
 
-				err := syncer.syncTableWithRetry(ctx, pgSchemaTable, structureConn, copyConn, databaseUrl, internalTableMetadata, incrementalRefresh)
+				err := syncer.syncTableWithRetry(ctx, pgSchemaTable, structureConn, copyConn, databaseUrl, snapshotID, internalTableMetadata, incrementalRefresh)
 				if err != nil {
 					LogError(syncer.config, "Failed to sync table", pgSchemaTable.String()+":", err)
 					continue
@@ -108,7 +111,7 @@ const MAX_RECOVERY_CONFLICT_RETRIES = 3
 // syncTableWithRetry wraps SyncPgTable with retry logic for hot standby
 // recovery conflicts (SQLSTATE 40001). On conflict, it creates a fresh copy
 // connection with a new transaction and retries.
-func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, databaseUrl string, internalTableMetadata InternalTableMetadata, incrementalRefresh bool) error {
+func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, databaseUrl string, snapshotID string, internalTableMetadata InternalTableMetadata, incrementalRefresh bool) error {
 	currentCopyConn := copyConn
 
 	for attempt := 0; attempt <= MAX_RECOVERY_CONFLICT_RETRIES; attempt++ {
@@ -131,10 +134,11 @@ func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSc
 				"retrying (attempt", fmt.Sprintf("%d/%d)", attempt+2, MAX_RECOVERY_CONFLICT_RETRIES+1))
 
 			// Close the retry connection (not the original) and create a fresh one
+			// using the same snapshot for cross-table consistency
 			if currentCopyConn != copyConn {
 				currentCopyConn.Close(ctx)
 			}
-			currentCopyConn = syncer.newConnection(ctx, databaseUrl)
+			currentCopyConn = syncer.newConnectionWithSnapshot(ctx, databaseUrl, snapshotID)
 			continue
 		}
 
@@ -287,6 +291,31 @@ func (syncer *Syncer) newConnection(ctx context.Context, databaseUrl string) *pg
 		PanicIfError(syncer.config, err)
 	}
 
+	return conn
+}
+
+func (syncer *Syncer) exportSnapshot(ctx context.Context, conn *pgx.Conn) string {
+	var snapshotID string
+	err := conn.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&snapshotID)
+	if err != nil {
+		// pg_export_snapshot may not be available (e.g., some managed PG services)
+		LogWarn(syncer.config, "Could not export snapshot:", err, "— copy connections will use independent snapshots")
+		return ""
+	}
+	LogDebug(syncer.config, "Exported snapshot:", snapshotID)
+	return snapshotID
+}
+
+func (syncer *Syncer) newConnectionWithSnapshot(ctx context.Context, databaseUrl string, snapshotID string) *pgx.Conn {
+	conn := syncer.newConnection(ctx, databaseUrl)
+	if snapshotID != "" {
+		_, err := conn.Exec(ctx, "SET TRANSACTION SNAPSHOT '"+snapshotID+"'")
+		if err != nil {
+			LogWarn(syncer.config, "Could not set transaction snapshot:", err, "— using independent snapshot")
+		} else {
+			LogDebug(syncer.config, "Set transaction snapshot:", snapshotID)
+		}
+	}
 	return conn
 }
 
