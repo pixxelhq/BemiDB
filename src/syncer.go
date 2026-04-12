@@ -78,7 +78,11 @@ func (syncer *Syncer) SyncFromPostgres() {
 
 				incrementalRefresh := syncer.config.Pg.IncrementallyRefreshedTables != nil && HasExactOrWildcardMatch(syncer.config.Pg.IncrementallyRefreshedTables, pgSchemaTable.ToConfigArg())
 
-				syncer.syncerTable.SyncPgTable(pgSchemaTable, structureConn, copyConn, internalTableMetadata, incrementalRefresh)
+				err := syncer.syncTableWithRetry(ctx, pgSchemaTable, structureConn, copyConn, databaseUrl, internalTableMetadata, incrementalRefresh)
+				if err != nil {
+					LogError(syncer.config, "Failed to sync table", pgSchemaTable.String()+":", err)
+					continue
+				}
 				LogInfo(syncer.config, "Finished writing to Iceberg\n")
 
 				syncedPgSchemaTables = append(syncedPgSchemaTables, pgSchemaTable)
@@ -97,6 +101,50 @@ func (syncer *Syncer) SyncFromPostgres() {
 	} else {
 		syncer.sendAnonymousAnalytics("sync-finish-incremental")
 	}
+}
+
+const MAX_RECOVERY_CONFLICT_RETRIES = 3
+
+// syncTableWithRetry wraps SyncPgTable with retry logic for hot standby
+// recovery conflicts (SQLSTATE 40001). On conflict, it creates a fresh copy
+// connection with a new transaction and retries.
+func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, databaseUrl string, internalTableMetadata InternalTableMetadata, incrementalRefresh bool) error {
+	currentCopyConn := copyConn
+
+	for attempt := 0; attempt <= MAX_RECOVERY_CONFLICT_RETRIES; attempt++ {
+		err := syncer.syncerTable.SyncPgTable(pgSchemaTable, structureConn, currentCopyConn, internalTableMetadata, incrementalRefresh)
+		if err == nil {
+			return nil
+		}
+
+		// Check if this is a recovery conflict (hot standby WAL replay conflict)
+		isRecoveryConflict := false
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01") {
+			isRecoveryConflict = true
+		} else if strings.Contains(strings.ToLower(err.Error()), "conflict with recovery") {
+			isRecoveryConflict = true
+		}
+
+		if isRecoveryConflict && attempt < MAX_RECOVERY_CONFLICT_RETRIES {
+			LogWarn(syncer.config, "Recovery conflict syncing", pgSchemaTable.String()+",",
+				"retrying (attempt", fmt.Sprintf("%d/%d)", attempt+2, MAX_RECOVERY_CONFLICT_RETRIES+1))
+
+			// Close the retry connection (not the original) and create a fresh one
+			if currentCopyConn != copyConn {
+				currentCopyConn.Close(ctx)
+			}
+			currentCopyConn = syncer.newConnection(ctx, databaseUrl)
+			continue
+		}
+
+		// Not a recovery conflict or exhausted retries — clean up and return error
+		if currentCopyConn != copyConn {
+			currentCopyConn.Close(ctx)
+		}
+		return err
+	}
+	return nil
 }
 
 func (syncer *Syncer) WriteInternalStartSqlFile(pgSchemaTables []PgSchemaTable) {

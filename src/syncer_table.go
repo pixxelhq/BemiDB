@@ -20,7 +20,7 @@ func NewSyncerTable(config *Config) *SyncerTable {
 	return &SyncerTable{config: config}
 }
 
-func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, existingInternalTableMetadata InternalTableMetadata, incrementalRefresh bool) {
+func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, existingInternalTableMetadata InternalTableMetadata, incrementalRefresh bool) error {
 	// If there is the previous internal metadata and (we perform an incremental refresh or perform a full refresh with the previous full-in-progress mode)
 	continuedRefresh := existingInternalTableMetadata.MaxXmin != nil &&
 		(incrementalRefresh || existingInternalTableMetadata.LastRefreshMode == RefreshModeFullInProgress)
@@ -28,6 +28,7 @@ func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureCon
 
 	// Create a capped buffer read and written in parallel
 	cappedBuffer := NewCappedBuffer(MAX_IN_MEMORY_BUFFER_SIZE, syncer.config)
+	copyErrChan := make(chan error, 1)
 	var waitGroup sync.WaitGroup
 
 	// Copy from PG to cappedBuffer in a separate goroutine in parallel ------------------------------------------------
@@ -35,7 +36,10 @@ func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureCon
 	go func() {
 		LogInfo(syncer.config, "Reading from Postgres:", pgSchemaTable.String()+"...")
 		copySql := syncer.CopyFromPgTableSql(pgSchemaTable, existingInternalTableMetadata, currentTxid, continuedRefresh)
-		syncer.copyFromPgTable(copySql, copyConn, cappedBuffer, &waitGroup)
+		copyErr := syncer.copyFromPgTable(copySql, copyConn, cappedBuffer, &waitGroup)
+		if copyErr != nil {
+			copyErrChan <- copyErr
+		}
 	}()
 
 	// Ping PG using structureConn in a separate goroutine in parallel to keep the connection alive --------------------
@@ -135,6 +139,14 @@ func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureCon
 
 	close(stopPingChannel) // Stop the pingPg goroutine
 	waitGroup.Wait()       // Wait for the Read goroutine to finish
+
+	// Check for COPY errors (e.g., recovery conflict on hot standby)
+	select {
+	case copyErr := <-copyErrChan:
+		return copyErr
+	default:
+		return nil
+	}
 }
 
 func (syncer *SyncerTable) CopyFromPgTableSql(
@@ -279,14 +291,16 @@ func (syncer *SyncerTable) pgTableSchemaColumns(conn *pgx.Conn, pgSchemaTable Pg
 	return pgSchemaColumns
 }
 
-func (syncer *SyncerTable) copyFromPgTable(copySql string, copyConn *pgx.Conn, cappedBuffer *CappedBuffer, waitGroup *sync.WaitGroup) {
+func (syncer *SyncerTable) copyFromPgTable(copySql string, copyConn *pgx.Conn, cappedBuffer *CappedBuffer, waitGroup *sync.WaitGroup) error {
 	LogDebug(syncer.config, copySql)
 	result, err := copyConn.PgConn().CopyTo(context.Background(), cappedBuffer, copySql)
-	PanicIfError(syncer.config, err)
-	LogInfo(syncer.config, "Copied", result.RowsAffected(), "row(s)...")
-
 	cappedBuffer.Close()
 	waitGroup.Done()
+	if err != nil {
+		return err
+	}
+	LogInfo(syncer.config, "Copied", result.RowsAffected(), "row(s)...")
+	return nil
 }
 
 func (syncer *SyncerTable) currentTxid(conn *pgx.Conn) int64 {
