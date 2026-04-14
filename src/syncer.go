@@ -307,14 +307,22 @@ func (syncer *Syncer) exportSnapshot(ctx context.Context, conn *pgx.Conn) string
 }
 
 func (syncer *Syncer) newConnectionWithSnapshot(ctx context.Context, databaseUrl string, snapshotID string) *pgx.Conn {
-	conn := syncer.newConnection(ctx, databaseUrl)
-	if snapshotID != "" {
-		_, err := conn.Exec(ctx, "SET TRANSACTION SNAPSHOT '"+snapshotID+"'")
-		if err != nil {
-			LogWarn(syncer.config, "Could not set transaction snapshot:", err, "— using independent snapshot")
-		} else {
-			LogDebug(syncer.config, "Set transaction snapshot:", snapshotID)
-		}
+	if snapshotID == "" {
+		return syncer.newConnection(ctx, databaseUrl)
+	}
+
+	// SET TRANSACTION SNAPSHOT requires REPEATABLE READ (not SERIALIZABLE DEFERRABLE)
+	conn, err := pgx.Connect(ctx, databaseUrl)
+	PanicIfError(syncer.config, err)
+
+	_, err = conn.Exec(ctx, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+	PanicIfError(syncer.config, err)
+
+	_, err = conn.Exec(ctx, "SET TRANSACTION SNAPSHOT '"+snapshotID+"'")
+	if err != nil {
+		LogWarn(syncer.config, "Could not set transaction snapshot:", err, "— using independent snapshot")
+	} else {
+		LogDebug(syncer.config, "Set transaction snapshot:", snapshotID)
 	}
 	return conn
 }
