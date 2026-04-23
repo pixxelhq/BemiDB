@@ -77,9 +77,9 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 	}
 
 	if config.EnableCache {
-		_, err = duckdb.ExecContext(ctx, "SET enable_object_cache=true", nil)
+		_, err = duckdb.ExecContext(ctx, "SET enable_http_metadata_cache=true", nil)
 		PanicIfError(config, err)
-		LogInfo(config, "DuckDB: Object cache enabled")
+		LogInfo(config, "DuckDB: HTTP metadata cache enabled")
 	}
 
 	switch config.StorageType {
