@@ -83,9 +83,9 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 	}
 
 	if config.EnableHttpConnectionCache {
-		_, err = duckdb.ExecContext(ctx, "SET http_keep_alive=true", nil)
+		_, err = duckdb.ExecContext(ctx, "SET httpfs_connection_caching=true", nil)
 		PanicIfError(config, err)
-		LogInfo(config, "DuckDB: HTTP connection keep-alive enabled")
+		LogInfo(config, "DuckDB: HTTPFS connection caching enabled")
 	}
 
 	switch config.StorageType {
