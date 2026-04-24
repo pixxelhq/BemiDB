@@ -82,6 +82,12 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 		LogInfo(config, "DuckDB: HTTP metadata cache enabled")
 	}
 
+	if config.EnableHttpConnectionCache {
+		_, err = duckdb.ExecContext(ctx, "SET http_keep_alive=true", nil)
+		PanicIfError(config, err)
+		LogInfo(config, "DuckDB: HTTP connection keep-alive enabled")
+	}
+
 	switch config.StorageType {
 	case STORAGE_TYPE_S3:
 		if duckdb.config.Aws.AccessKeyId != "" && duckdb.config.Aws.SecretAccessKey != "" {

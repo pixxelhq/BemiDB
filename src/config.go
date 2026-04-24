@@ -33,7 +33,8 @@ const (
 	ENV_PG_INCREMENTALLY_REFRESHED_TABLES = "PG_INCREMENTALLY_REFRESHED_TABLES"
 	ENV_PG_PRESERVE_UNSYNCED              = "PG_PRESERVE_UNSYNCED"
 
-	ENV_ENABLE_CACHE = "BEMIDB_ENABLE_CACHE"
+	ENV_ENABLE_CACHE                = "BEMIDB_ENABLE_CACHE"
+	ENV_ENABLE_HTTP_CONNECTION_CACHE = "BEMIDB_ENABLE_HTTP_CONNECTION_CACHE"
 
 	ENV_LOG_LEVEL                   = "BEMIDB_LOG_LEVEL"
 	ENV_DISABLE_ANONYMOUS_ANALYTICS = "BEMIDB_DISABLE_ANONYMOUS_ANALYTICS"
@@ -80,6 +81,7 @@ type Config struct {
 	User                      string
 	EncryptedPassword         string
 	EnableCache               bool
+	EnableHttpConnectionCache bool
 	LogLevel                  string
 	StorageType               string
 	StoragePath               string
@@ -109,6 +111,7 @@ func registerFlags() {
 	flag.StringVar(&_config.User, "user", os.Getenv(ENV_USER), "Database user. Default: \""+DEFAULT_USER+"\"")
 	flag.StringVar(&_configParseValues.password, "password", os.Getenv(ENV_PASSWORD), "Database password. Default: \""+DEFAULT_PASSWORD+"\"")
 	flag.BoolVar(&_config.EnableCache, "enable-cache", os.Getenv(ENV_ENABLE_CACHE) == "true", "Enable DuckDB HTTP metadata cache for remote files. Default: false")
+	flag.BoolVar(&_config.EnableHttpConnectionCache, "enable-http-connection-cache", os.Getenv(ENV_ENABLE_HTTP_CONNECTION_CACHE) == "true", "Enable DuckDB HTTP connection keep-alive for remote files. Default: false")
 	flag.StringVar(&_config.StoragePath, "storage-path", os.Getenv(ENV_STORAGE_PATH), "Path to the storage folder. Default: \""+DEFAULT_STORAGE_PATH+"\"")
 	flag.StringVar(&_config.LogLevel, "log-level", os.Getenv(ENV_LOG_LEVEL), "Log level: \"ERROR\", \"WARN\", \"INFO\", \"DEBUG\", \"TRACE\". Default: \""+DEFAULT_LOG_LEVEL+"\"")
 	flag.StringVar(&_config.StorageType, "storage-type", os.Getenv(ENV_STORAGE_TYPE), "Storage type: \"LOCAL\", \"S3\". Default: \""+DEFAULT_DB_STORAGE_TYPE+"\"")
