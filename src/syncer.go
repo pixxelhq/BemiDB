@@ -109,10 +109,11 @@ func (syncer *Syncer) SyncFromPostgres() {
 const MAX_RECOVERY_CONFLICT_RETRIES = 3
 
 // syncTableWithRetry wraps SyncPgTable with retry logic for hot standby
-// recovery conflicts (SQLSTATE 40001). On conflict, it creates a fresh copy
-// connection with a new transaction and retries.
+// recovery conflicts (SQLSTATE 40001) and snapshot invalidation errors.
+// On conflict, it creates a fresh copy connection and retries.
 func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, databaseUrl string, snapshotID string, internalTableMetadata InternalTableMetadata, incrementalRefresh bool) error {
 	currentCopyConn := copyConn
+	currentSnapshotID := snapshotID
 
 	for attempt := 0; attempt <= MAX_RECOVERY_CONFLICT_RETRIES; attempt++ {
 		err := syncer.syncerTable.SyncPgTable(pgSchemaTable, structureConn, currentCopyConn, internalTableMetadata, incrementalRefresh)
@@ -120,29 +121,40 @@ func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSc
 			return nil
 		}
 
-		// Check if this is a recovery conflict (hot standby WAL replay conflict)
-		isRecoveryConflict := false
+		isRetryable := false
+		errLower := strings.ToLower(err.Error())
+
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01") {
-			isRecoveryConflict = true
-		} else if strings.Contains(strings.ToLower(err.Error()), "conflict with recovery") {
-			isRecoveryConflict = true
+			isRetryable = true
+		} else if strings.Contains(errLower, "conflict with recovery") {
+			isRetryable = true
 		}
 
-		if isRecoveryConflict && attempt < MAX_RECOVERY_CONFLICT_RETRIES {
+		// Snapshot invalidation: the exported snapshot was cleaned up by standby
+		// WAL replay or the exporting transaction was terminated
+		if strings.Contains(errLower, "snapshot") && (strings.Contains(errLower, "does not exist") || strings.Contains(errLower, "not found") || strings.Contains(errLower, "invalid")) {
+			isRetryable = true
+			currentSnapshotID = ""
+		}
+
+		// Transaction aborted state from a prior snapshot or conflict error
+		if strings.Contains(errLower, "current transaction is aborted") {
+			isRetryable = true
+			currentSnapshotID = ""
+		}
+
+		if isRetryable && attempt < MAX_RECOVERY_CONFLICT_RETRIES {
 			LogWarn(syncer.config, "Recovery conflict syncing", pgSchemaTable.String()+",",
 				"retrying (attempt", fmt.Sprintf("%d/%d)", attempt+2, MAX_RECOVERY_CONFLICT_RETRIES+1))
 
-			// Close the retry connection (not the original) and create a fresh one
-			// using the same snapshot for cross-table consistency
 			if currentCopyConn != copyConn {
 				currentCopyConn.Close(ctx)
 			}
-			currentCopyConn = syncer.newConnectionWithSnapshot(ctx, databaseUrl, snapshotID)
+			currentCopyConn = syncer.newConnectionWithSnapshot(ctx, databaseUrl, currentSnapshotID)
 			continue
 		}
 
-		// Not a recovery conflict or exhausted retries — clean up and return error
 		if currentCopyConn != copyConn {
 			currentCopyConn.Close(ctx)
 		}
@@ -320,7 +332,13 @@ func (syncer *Syncer) newConnectionWithSnapshot(ctx context.Context, databaseUrl
 
 	_, err = conn.Exec(ctx, "SET TRANSACTION SNAPSHOT '"+snapshotID+"'")
 	if err != nil {
+		// Snapshot may have been invalidated (e.g., standby WAL replay cleaned it up).
+		// The transaction is now in an error state — rollback and start a fresh one
+		// without the snapshot so the connection remains usable.
 		LogWarn(syncer.config, "Could not set transaction snapshot:", err, "— using independent snapshot")
+		_, _ = conn.Exec(ctx, "ROLLBACK")
+		_, err = conn.Exec(ctx, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+		PanicIfError(syncer.config, err)
 	} else {
 		LogDebug(syncer.config, "Set transaction snapshot:", snapshotID)
 	}
