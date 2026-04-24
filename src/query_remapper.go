@@ -274,9 +274,11 @@ func (remapper *QueryRemapper) remapJoinExpressions(selectStatement *pgQuery.Sel
 		if node.GetJoinExpr().Jointype != pgQuery.JoinType_JOIN_INNER {
 			// Change the JOIN type to INNER in some cases like: ON ... = indclass[i] (sent via Postico)
 			if indentLevel > 2 && node.GetJoinExpr().Quals.GetAExpr() != nil && node.GetJoinExpr().Quals.GetAExpr().Rexpr.GetAIndirection() != nil {
-				rightIndirectionColumnRef := node.GetJoinExpr().Quals.GetAExpr().Rexpr.GetAIndirection().Arg.GetColumnRef().Fields[0].GetString_().Sval
-				if rightIndirectionColumnRef == "indclass" {
-					node.GetJoinExpr().Jointype = pgQuery.JoinType_JOIN_INNER
+				indirectionArg := node.GetJoinExpr().Quals.GetAExpr().Rexpr.GetAIndirection().Arg
+				if colRef := indirectionArg.GetColumnRef(); colRef != nil && len(colRef.Fields) > 0 {
+					if colRef.Fields[0].GetString_().Sval == "indclass" {
+						node.GetJoinExpr().Jointype = pgQuery.JoinType_JOIN_INNER
+					}
 				}
 			}
 		}
