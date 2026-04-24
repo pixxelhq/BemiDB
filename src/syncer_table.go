@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/csv"
 	"errors"
+	"fmt"
 	"io"
 	"runtime"
 	"sync"
@@ -21,17 +22,24 @@ func NewSyncerTable(config *Config) *SyncerTable {
 }
 
 func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, existingInternalTableMetadata InternalTableMetadata, incrementalRefresh bool) error {
-	// If there is the previous internal metadata and (we perform an incremental refresh or perform a full refresh with the previous full-in-progress mode)
 	continuedRefresh := existingInternalTableMetadata.MaxXmin != nil &&
 		(incrementalRefresh || existingInternalTableMetadata.LastRefreshMode == RefreshModeFullInProgress)
-	currentTxid := syncer.currentTxid(structureConn)
 
-	// Create a capped buffer read and written in parallel
+	currentTxid, err := syncer.currentTxid(structureConn)
+	if err != nil {
+		return fmt.Errorf("structure connection lost: %w", err)
+	}
+
+	dynamicRowCountPerBatch, err := syncer.calculatedynamicRowCountPerBatch(pgSchemaTable, structureConn)
+	if err != nil {
+		return fmt.Errorf("structure connection lost: %w", err)
+	}
+	LogDebug(syncer.config, "Calculated row count per batch:", dynamicRowCountPerBatch, "Continued refresh:", continuedRefresh, "Incremental refresh:", incrementalRefresh)
+
 	cappedBuffer := NewCappedBuffer(MAX_IN_MEMORY_BUFFER_SIZE, syncer.config)
 	copyErrChan := make(chan error, 1)
 	var waitGroup sync.WaitGroup
 
-	// Copy from PG to cappedBuffer in a separate goroutine in parallel ------------------------------------------------
 	waitGroup.Add(1)
 	go func() {
 		LogInfo(syncer.config, "Reading from Postgres:", pgSchemaTable.String()+"...")
@@ -42,32 +50,37 @@ func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureCon
 		}
 	}()
 
-	// Ping PG using structureConn in a separate goroutine in parallel to keep the connection alive --------------------
 	stopPingChannel := make(chan struct{})
 	waitGroup.Add(1)
 	go func() {
 		syncer.pingPg(structureConn, &stopPingChannel, &waitGroup)
 	}()
 
-	// Read from cappedBuffer and write to Iceberg ---------------------------------------------------------------------
-
 	var lastTxid int64
 	if existingInternalTableMetadata.LastRefreshMode == RefreshModeFullInProgress && existingInternalTableMetadata.LastTxid != 0 {
-		lastTxid = existingInternalTableMetadata.LastTxid // We'll continue from the initial txid after a full sync is completed
+		lastTxid = existingInternalTableMetadata.LastTxid
 	} else {
 		lastTxid = currentTxid
 	}
 
-	// Identify the batch size dynamically based on the table stats
-	dynamicRowCountPerBatch := syncer.calculatedynamicRowCountPerBatch(pgSchemaTable, structureConn)
-	LogDebug(syncer.config, "Calculated row count per batch:", dynamicRowCountPerBatch, "Continued refresh:", continuedRefresh, "Incremental refresh:", incrementalRefresh)
-
-	// Read the header to get the column information
 	csvReader := csv.NewReader(cappedBuffer)
 	csvHeaders, err := csvReader.Read()
-	PanicIfError(syncer.config, err)
-	csvHeaders = csvHeaders[:len(csvHeaders)-1] // Ignore the last column (xmin)
-	pgSchemaColumns := syncer.pgTableSchemaColumns(structureConn, pgSchemaTable, csvHeaders)
+	if err != nil {
+		close(stopPingChannel)
+		select {
+		case copyErr := <-copyErrChan:
+			return copyErr
+		default:
+		}
+		return fmt.Errorf("failed to read from copy stream: %w", err)
+	}
+	csvHeaders = csvHeaders[:len(csvHeaders)-1]
+
+	pgSchemaColumns, err := syncer.pgTableSchemaColumns(structureConn, pgSchemaTable, csvHeaders)
+	if err != nil {
+		close(stopPingChannel)
+		return fmt.Errorf("structure connection lost: %w", err)
+	}
 
 	icebergTableWriter := NewIcebergWriterTable(
 		syncer.config,
@@ -223,9 +236,9 @@ func (syncer *SyncerTable) CopyFromPgTableSql(
 	}
 }
 
-func (syncer *SyncerTable) pgTableSchemaColumns(conn *pgx.Conn, pgSchemaTable PgSchemaTable, csvHeaders []string) []PgSchemaColumn {
+func (syncer *SyncerTable) pgTableSchemaColumns(conn *pgx.Conn, pgSchemaTable PgSchemaTable, csvHeaders []string) ([]PgSchemaColumn, error) {
 	if len(csvHeaders) == 0 {
-		PanicIfError(syncer.config, errors.New("couldn't read data from "+pgSchemaTable.String()))
+		return nil, errors.New("couldn't read data from " + pgSchemaTable.String())
 	}
 
 	var pgSchemaColumns []PgSchemaColumn
@@ -266,7 +279,9 @@ func (syncer *SyncerTable) pgTableSchemaColumns(conn *pgx.Conn, pgSchemaTable Pg
 		pgSchemaTable.Table,
 		csvHeaders,
 	)
-	PanicIfError(syncer.config, err)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 
 	for rows.Next() {
@@ -284,11 +299,13 @@ func (syncer *SyncerTable) pgTableSchemaColumns(conn *pgx.Conn, pgSchemaTable Pg
 			&pgSchemaColumn.Namespace,
 			&pgSchemaColumn.PartOfPrimaryKey,
 		)
-		PanicIfError(syncer.config, err)
+		if err != nil {
+			return nil, err
+		}
 		pgSchemaColumns = append(pgSchemaColumns, *pgSchemaColumn)
 	}
 
-	return pgSchemaColumns
+	return pgSchemaColumns, nil
 }
 
 func (syncer *SyncerTable) copyFromPgTable(copySql string, copyConn *pgx.Conn, cappedBuffer *CappedBuffer, waitGroup *sync.WaitGroup) error {
@@ -303,14 +320,16 @@ func (syncer *SyncerTable) copyFromPgTable(copySql string, copyConn *pgx.Conn, c
 	return nil
 }
 
-func (syncer *SyncerTable) currentTxid(conn *pgx.Conn) int64 {
+func (syncer *SyncerTable) currentTxid(conn *pgx.Conn) (int64, error) {
 	var txid int64
 	err := conn.QueryRow(context.Background(), `SELECT txid_snapshot_xmin(txid_current_snapshot())`).Scan(&txid)
-	PanicIfError(syncer.config, err)
-	return txid
+	if err != nil {
+		return 0, err
+	}
+	return txid, nil
 }
 
-func (syncer *SyncerTable) calculatedynamicRowCountPerBatch(pgSchemaTable PgSchemaTable, conn *pgx.Conn) int {
+func (syncer *SyncerTable) calculatedynamicRowCountPerBatch(pgSchemaTable PgSchemaTable, conn *pgx.Conn) (int, error) {
 	var tableSize int64
 	var rowCount int64
 
@@ -329,20 +348,22 @@ func (syncer *SyncerTable) calculatedynamicRowCountPerBatch(pgSchemaTable PgSche
 		pgSchemaTable.Schema,
 		pgSchemaTable.Table,
 	).Scan(&tableSize, &rowCount)
-	PanicIfError(syncer.config, err)
+	if err != nil {
+		return 0, err
+	}
 	LogDebug(syncer.config, "Read table size:", tableSize, "Approximate row count:", rowCount)
 
 	if tableSize == 0 || rowCount == 0 {
-		return 1
+		return 1, nil
 	}
 
 	rowSize := tableSize / rowCount
 	dynamicRowCountPerBatch := int(MAX_PG_ROWS_BATCH_SIZE / rowSize)
 	if dynamicRowCountPerBatch == 0 {
-		return 1
+		return 1, nil
 	}
 
-	return dynamicRowCountPerBatch
+	return dynamicRowCountPerBatch, nil
 }
 
 func (syncer *SyncerTable) pingPg(conn *pgx.Conn, stopPingChannel *chan struct{}, waitGroup *sync.WaitGroup) {
@@ -358,7 +379,12 @@ func (syncer *SyncerTable) pingPg(conn *pgx.Conn, stopPingChannel *chan struct{}
 		case <-ticker.C:
 			LogDebug(syncer.config, "Pinging the database...")
 			_, err := conn.Exec(context.Background(), "SELECT 1")
-			PanicIfError(syncer.config, err)
+			if err != nil {
+				LogWarn(syncer.config, "Ping failed (connection may have been terminated by recovery conflict):", err)
+				waitGroup.Done()
+				ticker.Stop()
+				return
+			}
 		}
 	}
 }

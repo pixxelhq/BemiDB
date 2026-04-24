@@ -60,16 +60,15 @@ func (syncer *Syncer) SyncFromPostgres() {
 	icebergSchemaTables, icebergSchemaTablesErr := syncer.icebergReader.SchemaTables()
 
 	structureConn := syncer.newConnection(ctx, databaseUrl)
-	defer structureConn.Close(ctx)
-
-	// Export snapshot from structureConn so all copy connections see the same data
 	snapshotID := syncer.exportSnapshot(ctx, structureConn)
-
 	copyConn := syncer.newConnectionWithSnapshot(ctx, databaseUrl, snapshotID)
-	defer copyConn.Close(ctx)
 
-	syncedPgSchemaTables := []PgSchemaTable{}
-
+	type pendingTable struct {
+		pgSchemaTable         PgSchemaTable
+		internalTableMetadata InternalTableMetadata
+		incrementalRefresh    bool
+	}
+	var pendingTables []pendingTable
 	for _, schema := range syncer.listPgSchemas(structureConn) {
 		for _, pgSchemaTable := range syncer.listPgSchemaTables(structureConn, schema) {
 			if syncer.shouldSyncTable(pgSchemaTable) {
@@ -78,20 +77,43 @@ func (syncer *Syncer) SyncFromPostgres() {
 				if syncedPreviously {
 					internalTableMetadata = syncer.readInternalTableMetadata(pgSchemaTable)
 				}
-
 				incrementalRefresh := syncer.config.Pg.IncrementallyRefreshedTables != nil && HasExactOrWildcardMatch(syncer.config.Pg.IncrementallyRefreshedTables, pgSchemaTable.ToConfigArg())
-
-				err := syncer.syncTableWithRetry(ctx, pgSchemaTable, structureConn, copyConn, databaseUrl, snapshotID, internalTableMetadata, incrementalRefresh)
-				if err != nil {
-					LogError(syncer.config, "Failed to sync table", pgSchemaTable.String()+":", err)
-					continue
-				}
-				LogInfo(syncer.config, "Finished writing to Iceberg\n")
-
-				syncedPgSchemaTables = append(syncedPgSchemaTables, pgSchemaTable)
+				pendingTables = append(pendingTables, pendingTable{pgSchemaTable, internalTableMetadata, incrementalRefresh})
 			}
 		}
 	}
+
+	syncedPgSchemaTables := []PgSchemaTable{}
+	for _, table := range pendingTables {
+		if err := structureConn.Ping(ctx); err != nil {
+			LogWarn(syncer.config, "Structure connection lost, reconnecting...")
+			structureConn.Close(ctx)
+			structureConn = syncer.newConnection(ctx, databaseUrl)
+			snapshotID = ""
+		}
+		if err := copyConn.Ping(ctx); err != nil {
+			LogWarn(syncer.config, "Copy connection lost, reconnecting...")
+			copyConn.Close(ctx)
+			copyConn = syncer.newConnectionWithSnapshot(ctx, databaseUrl, snapshotID)
+		}
+
+		newStructureConn, newSnapshotID, err := syncer.syncTableWithRetry(ctx, table.pgSchemaTable, structureConn, copyConn, databaseUrl, snapshotID, table.internalTableMetadata, table.incrementalRefresh)
+		if newStructureConn != structureConn {
+			structureConn.Close(ctx)
+			structureConn = newStructureConn
+		}
+		snapshotID = newSnapshotID
+
+		if err != nil {
+			LogError(syncer.config, "Failed to sync table", table.pgSchemaTable.String()+":", err)
+			continue
+		}
+		LogInfo(syncer.config, "Finished writing to Iceberg\n")
+		syncedPgSchemaTables = append(syncedPgSchemaTables, table.pgSchemaTable)
+	}
+
+	structureConn.Close(ctx)
+	copyConn.Close(ctx)
 
 	syncer.WriteInternalStartSqlFile(syncedPgSchemaTables)
 
@@ -109,16 +131,18 @@ func (syncer *Syncer) SyncFromPostgres() {
 const MAX_RECOVERY_CONFLICT_RETRIES = 3
 
 // syncTableWithRetry wraps SyncPgTable with retry logic for hot standby
-// recovery conflicts (SQLSTATE 40001) and snapshot invalidation errors.
-// On conflict, it creates a fresh copy connection and retries.
-func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, databaseUrl string, snapshotID string, internalTableMetadata InternalTableMetadata, incrementalRefresh bool) error {
+// recovery conflicts (SQLSTATE 40001), snapshot invalidation, and connection
+// termination. Returns the (possibly reconnected) structureConn and snapshotID
+// so the caller can use them for subsequent tables.
+func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, databaseUrl string, snapshotID string, internalTableMetadata InternalTableMetadata, incrementalRefresh bool) (*pgx.Conn, string, error) {
 	currentCopyConn := copyConn
+	currentStructureConn := structureConn
 	currentSnapshotID := snapshotID
 
 	for attempt := 0; attempt <= MAX_RECOVERY_CONFLICT_RETRIES; attempt++ {
-		err := syncer.syncerTable.SyncPgTable(pgSchemaTable, structureConn, currentCopyConn, internalTableMetadata, incrementalRefresh)
+		err := syncer.syncerTable.SyncPgTable(pgSchemaTable, currentStructureConn, currentCopyConn, internalTableMetadata, incrementalRefresh)
 		if err == nil {
-			return nil
+			return currentStructureConn, currentSnapshotID, nil
 		}
 
 		isRetryable := false
@@ -131,15 +155,20 @@ func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSc
 			isRetryable = true
 		}
 
-		// Snapshot invalidation: the exported snapshot was cleaned up by standby
-		// WAL replay or the exporting transaction was terminated
 		if strings.Contains(errLower, "snapshot") && (strings.Contains(errLower, "does not exist") || strings.Contains(errLower, "not found") || strings.Contains(errLower, "invalid")) {
 			isRetryable = true
 			currentSnapshotID = ""
 		}
 
-		// Transaction aborted state from a prior snapshot or conflict error
 		if strings.Contains(errLower, "current transaction is aborted") {
+			isRetryable = true
+			currentSnapshotID = ""
+		}
+
+		// Connection terminated by standby WAL replay (FATAL) or network error
+		if strings.Contains(errLower, "conn closed") || strings.Contains(errLower, "connection reset") ||
+			strings.Contains(errLower, "broken pipe") || strings.Contains(errLower, "connection lost") ||
+			strings.Contains(errLower, "structure connection lost") {
 			isRetryable = true
 			currentSnapshotID = ""
 		}
@@ -147,6 +176,15 @@ func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSc
 		if isRetryable && attempt < MAX_RECOVERY_CONFLICT_RETRIES {
 			LogWarn(syncer.config, "Recovery conflict syncing", pgSchemaTable.String()+",",
 				"retrying (attempt", fmt.Sprintf("%d/%d)", attempt+2, MAX_RECOVERY_CONFLICT_RETRIES+1))
+
+			if err := currentStructureConn.Ping(ctx); err != nil {
+				LogWarn(syncer.config, "Structure connection lost, reconnecting...")
+				if currentStructureConn != structureConn {
+					currentStructureConn.Close(ctx)
+				}
+				currentStructureConn = syncer.newConnection(ctx, databaseUrl)
+				currentSnapshotID = ""
+			}
 
 			if currentCopyConn != copyConn {
 				currentCopyConn.Close(ctx)
@@ -158,9 +196,12 @@ func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSc
 		if currentCopyConn != copyConn {
 			currentCopyConn.Close(ctx)
 		}
-		return err
+		if currentStructureConn != structureConn {
+			currentStructureConn.Close(ctx)
+		}
+		return structureConn, snapshotID, err
 	}
-	return nil
+	return currentStructureConn, currentSnapshotID, nil
 }
 
 func (syncer *Syncer) WriteInternalStartSqlFile(pgSchemaTables []PgSchemaTable) {
