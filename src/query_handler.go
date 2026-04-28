@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -357,7 +358,11 @@ func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, prepar
 		}
 
 		if textFormat {
-			variables = append(variables, string(param))
+			val, err := castTextParam(string(param), preparedStatement.ParameterOIDs, i)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to cast parameter %d: %w. Original query: %s", i, err, preparedStatement.OriginalQuery)
+			}
+			variables = append(variables, val)
 		} else if len(param) == 4 {
 			variables = append(variables, int32(binary.BigEndian.Uint32(param)))
 		} else if len(param) == 8 {
@@ -377,6 +382,40 @@ func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, prepar
 	messages := []pgproto3.Message{&pgproto3.BindComplete{}}
 
 	return messages, preparedStatement, nil
+}
+
+var timestampParseFormats = []string{
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999Z07",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05.999999999Z07:00",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02T15:04:05",
+	"2006-01-02",
+}
+
+func castTextParam(text string, parameterOIDs []uint32, index int) (interface{}, error) {
+	if index >= len(parameterOIDs) {
+		return text, nil
+	}
+
+	switch parameterOIDs[index] {
+	case uint32(pgtype.TimestampOID), uint32(pgtype.TimestamptzOID):
+		for _, format := range timestampParseFormats {
+			if t, err := time.Parse(format, text); err == nil {
+				return t, nil
+			}
+		}
+		return text, nil
+	case uint32(pgtype.DateOID):
+		if t, err := time.Parse("2006-01-02", text); err == nil {
+			return t, nil
+		}
+		return text, nil
+	default:
+		return text, nil
+	}
 }
 
 func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
