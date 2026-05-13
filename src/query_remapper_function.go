@@ -52,6 +52,11 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 			WHEN 1 THEN len(arr)
 			ELSE NULL
 		END`,
+		`CREATE MACRO array_lower(arr, dimension) AS
+			CASE dimension
+			WHEN 1 THEN CASE WHEN len(arr) > 0 THEN 1 ELSE NULL END
+			ELSE NULL
+		END`,
 
 		// Table functions
 		"CREATE MACRO pg_is_in_recovery() AS TABLE SELECT false AS pg_is_in_recovery",
