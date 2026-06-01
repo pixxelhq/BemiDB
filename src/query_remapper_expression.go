@@ -43,6 +43,10 @@ func (remapper *QueryRemapperExpression) remappedTypeCast(node *pgQuery.Node) *p
 	typeName := remapper.parserTypeCast.TypeName(typeCast)
 
 	switch typeName {
+	case "jsonb":
+		// value::jsonb -> value::json (DuckDB has no jsonb type)
+		remapper.parserTypeCast.SetTypeName(typeCast, "json")
+		return node
 	case "text[]":
 		// '{a,b,c}'::text[] -> ARRAY['a', 'b', 'c']
 		return remapper.parserTypeCast.MakeListValueFromArray(typeCast.Arg)
