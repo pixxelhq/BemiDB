@@ -573,9 +573,9 @@ func (queryHandler *QueryHandler) columnTypeOid(col *sql.ColumnType) uint32 {
 	case "INTEGER[]":
 		return pgtype.Int4ArrayOID
 	case "UINTEGER":
-		return pgtype.XIDOID
+		return pgtype.Int8OID
 	case "UINTEGER[]":
-		return pgtype.XIDArrayOID
+		return pgtype.Int8ArrayOID
 	case "BIGINT":
 		if isSystemTableOidColumn(col.Name()) {
 			return pgtype.OIDOID
@@ -584,9 +584,9 @@ func (queryHandler *QueryHandler) columnTypeOid(col *sql.ColumnType) uint32 {
 	case "BIGINT[]":
 		return pgtype.Int8ArrayOID
 	case "UBIGINT":
-		return pgtype.XID8OID
+		return pgtype.Int8OID
 	case "UBIGINT[]":
-		return pgtype.XID8ArrayOID
+		return pgtype.Int8ArrayOID
 	case "HUGEINT":
 		return pgtype.NumericOID
 	case "HUGEINT[]":
