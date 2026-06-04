@@ -84,14 +84,15 @@ func (syncer *Syncer) SyncFromPostgres() {
 	}
 
 	syncedPgSchemaTables := []PgSchemaTable{}
+	var failedTables []string
 	for _, table := range pendingTables {
-		if err := structureConn.Ping(ctx); err != nil {
+		if !syncer.isConnectionHealthy(ctx, structureConn) {
 			LogWarn(syncer.config, "Structure connection lost, reconnecting...")
 			structureConn.Close(ctx)
 			structureConn = syncer.newConnection(ctx, databaseUrl)
 			snapshotID = ""
 		}
-		if err := copyConn.Ping(ctx); err != nil {
+		if !syncer.isConnectionHealthy(ctx, copyConn) {
 			LogWarn(syncer.config, "Copy connection lost, reconnecting...")
 			copyConn.Close(ctx)
 			copyConn = syncer.newConnectionWithSnapshot(ctx, databaseUrl, snapshotID)
@@ -106,6 +107,7 @@ func (syncer *Syncer) SyncFromPostgres() {
 
 		if err != nil {
 			LogError(syncer.config, "Failed to sync table", table.pgSchemaTable.String()+":", err)
+			failedTables = append(failedTables, table.pgSchemaTable.String())
 			continue
 		}
 		LogInfo(syncer.config, "Finished writing to Iceberg\n")
@@ -125,6 +127,10 @@ func (syncer *Syncer) SyncFromPostgres() {
 		syncer.sendAnonymousAnalytics("sync-finish")
 	} else {
 		syncer.sendAnonymousAnalytics("sync-finish-incremental")
+	}
+
+	if len(failedTables) > 0 {
+		PanicIfError(syncer.config, fmt.Errorf("failed to sync %d table(s): %s", len(failedTables), strings.Join(failedTables, ", ")))
 	}
 }
 
@@ -177,7 +183,7 @@ func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSc
 			LogWarn(syncer.config, "Recovery conflict syncing", pgSchemaTable.String()+",",
 				"retrying (attempt", fmt.Sprintf("%d/%d)", attempt+2, MAX_RECOVERY_CONFLICT_RETRIES+1))
 
-			if err := currentStructureConn.Ping(ctx); err != nil {
+			if !syncer.isConnectionHealthy(ctx, currentStructureConn) {
 				LogWarn(syncer.config, "Structure connection lost, reconnecting...")
 				if currentStructureConn != structureConn {
 					currentStructureConn.Close(ctx)
@@ -384,6 +390,15 @@ func (syncer *Syncer) newConnectionWithSnapshot(ctx context.Context, databaseUrl
 		LogDebug(syncer.config, "Set transaction snapshot:", snapshotID)
 	}
 	return conn
+}
+
+// isConnectionHealthy checks if a connection is alive AND its transaction is usable.
+// Ping() only checks TCP liveness — an aborted transaction (SQLSTATE 25P02) passes
+// Ping() but fails on any actual query.
+func (syncer *Syncer) isConnectionHealthy(ctx context.Context, conn *pgx.Conn) bool {
+	var result int
+	err := conn.QueryRow(ctx, "SELECT 1").Scan(&result)
+	return err == nil
 }
 
 func (syncer *Syncer) readInternalTableMetadata(pgSchemaTable PgSchemaTable) InternalTableMetadata {
