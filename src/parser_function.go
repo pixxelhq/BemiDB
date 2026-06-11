@@ -84,6 +84,9 @@ func (parser *ParserFunction) RemoveEncode(functionCall *pgQuery.FuncCall) {
 
 	firstArg := functionCall.Args[0]
 	nestedFunctionCall := firstArg.GetFuncCall()
+	if nestedFunctionCall == nil {
+		return
+	}
 	schemaFunction := parser.utils.SchemaFunction(nestedFunctionCall)
 	if schemaFunction.Function != "sha256" {
 		return

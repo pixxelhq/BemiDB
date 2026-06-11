@@ -564,10 +564,18 @@ func (queryHandler *QueryHandler) columnTypeOid(col *sql.ColumnType) uint32 {
 		return pgtype.BoolOID
 	case "BOOLEAN[]":
 		return pgtype.BoolArrayOID
+	case "TINYINT", "UTINYINT":
+		return pgtype.Int2OID
+	case "TINYINT[]", "UTINYINT[]":
+		return pgtype.Int2ArrayOID
 	case "SMALLINT":
 		return pgtype.Int2OID
 	case "SMALLINT[]":
 		return pgtype.Int2ArrayOID
+	case "USMALLINT":
+		return pgtype.Int4OID
+	case "USMALLINT[]":
+		return pgtype.Int4ArrayOID
 	case "INTEGER":
 		return pgtype.Int4OID
 	case "INTEGER[]":
@@ -636,8 +644,10 @@ func (queryHandler *QueryHandler) columnTypeOid(col *sql.ColumnType) uint32 {
 			}
 		}
 
-		Panic(queryHandler.config, "Unsupported serialized column type: "+col.DatabaseTypeName())
-		return 0
+		// Unknown types (e.g., INET structs from autoloaded extensions) degrade to text
+		// instead of panicking, which would kill the server for all connections
+		LogWarn(queryHandler.config, "Unsupported serialized column type, falling back to text:", col.DatabaseTypeName())
+		return pgtype.TextOID
 	}
 }
 
@@ -703,7 +713,10 @@ func (queryHandler *QueryHandler) generateDataRow(rows *sql.Rows, cols []*sql.Co
 			var value NullArray
 			valuePtrs[i] = &value
 		default:
-			Panic(queryHandler.config, "Unsupported data row type: "+col.ScanType().String())
+			// Unknown scan types (e.g., int8/uint8/uint16 from TINYINT, structs from
+			// extension types) scan generically and serialize via fmt instead of panicking
+			var value interface{}
+			valuePtrs[i] = &value
 		}
 	}
 
@@ -775,7 +788,10 @@ func (queryHandler *QueryHandler) generateDataRow(rows *sql.Rows, cols []*sql.Co
 				case "TIMESTAMPTZ":
 					values = append(values, []byte(value.Time.Format("2006-01-02 15:04:05.999999-07:00")))
 				default:
-					Panic(queryHandler.config, "Unsupported scanned time type: "+cols[i].DatabaseTypeName())
+					// Unknown time-like types (e.g., TIMETZ, TIMESTAMP_NS) degrade to a full
+					// timestamp format instead of panicking
+					LogWarn(queryHandler.config, "Unsupported scanned time type, using default format:", cols[i].DatabaseTypeName())
+					values = append(values, []byte(value.Time.Format("2006-01-02 15:04:05.999999-07:00")))
 				}
 			} else {
 				values = append(values, nil)
@@ -812,6 +828,12 @@ func (queryHandler *QueryHandler) generateDataRow(rows *sql.Rows, cols []*sql.Co
 			}
 		case *string:
 			values = append(values, []byte(*value))
+		case *interface{}:
+			if *value == nil {
+				values = append(values, nil)
+			} else {
+				values = append(values, []byte(fmt.Sprintf("%v", *value)))
+			}
 		default:
 			Panic(queryHandler.config, "Unsupported scanned row type: "+cols[i].ScanType().Name())
 		}
