@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/csv"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strings"
@@ -196,6 +197,10 @@ func (nullUuid *NullUuid) Scan(value interface{}) error {
 
 func (nullUuid NullUuid) String() string {
 	if nullUuid.Present {
+		if len(nullUuid.Value) != 16 {
+			// Not a valid UUID byte length — avoid slicing out of range
+			return fmt.Sprintf("%x", nullUuid.Value)
+		}
 		uuidString := string(nullUuid.Value)
 		return fmt.Sprintf("%x-%x-%x-%x-%x", uuidString[:4], uuidString[4:6], uuidString[6:8], uuidString[8:10], uuidString[10:])
 	}
@@ -225,6 +230,8 @@ func (nullArray NullArray) String() string {
 		var stringVals []string
 		for _, v := range nullArray.Value {
 			switch v.(type) {
+			case nil:
+				stringVals = append(stringVals, "NULL")
 			case []uint8:
 				stringVals = append(stringVals, fmt.Sprintf("%s", v))
 			default:
@@ -627,6 +634,12 @@ func (queryHandler *QueryHandler) columnTypeOid(col *sql.ColumnType) uint32 {
 		return pgtype.TimestamptzOID
 	case "TIMESTAMPTZ[]":
 		return pgtype.TimestamptzArrayOID
+	case "BLOB":
+		// Synced UUID columns come back from iceberg_scan as BLOB, so use text
+		// (values serialize as uuid strings or \x-hex depending on content)
+		return pgtype.TextOID
+	case "BLOB[]":
+		return pgtype.TextArrayOID
 	case "UUID":
 		return pgtype.UUIDOID
 	case "UUID[]":
@@ -691,9 +704,14 @@ func (queryHandler *QueryHandler) generateDataRow(rows *sql.Rows, cols []*sql.Co
 		case "string":
 			var value sql.NullString
 			valuePtrs[i] = &value
-		case "[]uint8": // uuid
-			var value NullUuid
-			valuePtrs[i] = &value
+		case "[]uint8": // uuid or blob
+			if col.DatabaseTypeName() == "UUID" {
+				var value NullUuid
+				valuePtrs[i] = &value
+			} else {
+				var value interface{}
+				valuePtrs[i] = &value
+			}
 		case "bool":
 			var value sql.NullBool
 			valuePtrs[i] = &value
@@ -831,6 +849,14 @@ func (queryHandler *QueryHandler) generateDataRow(rows *sql.Rows, cols []*sql.Co
 		case *interface{}:
 			if *value == nil {
 				values = append(values, nil)
+			} else if byteValue, ok := (*value).([]byte); ok {
+				if len(byteValue) == 16 {
+					// Synced UUID columns are stored as 16-byte blobs in Parquet
+					values = append(values, []byte(NullUuid{Present: true, Value: byteValue}.String()))
+				} else {
+					// Other BLOB/bytea values use PostgreSQL's hex output format
+					values = append(values, []byte("\\x"+hex.EncodeToString(byteValue)))
+				}
 			} else {
 				values = append(values, []byte(fmt.Sprintf("%v", *value)))
 			}
