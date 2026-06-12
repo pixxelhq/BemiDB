@@ -58,6 +58,33 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 			ELSE NULL
 		END`,
 
+		// PostgreSQL compatibility aliases (functions missing in DuckDB)
+		"CREATE MACRO char_length(s) AS length(s)",
+		"CREATE MACRO character_length(s) AS length(s)",
+		"CREATE MACRO btrim(s) AS trim(s), (s, chars) AS trim(s, chars)",
+		"CREATE MACRO every(x) AS bool_and(x)",
+		"CREATE MACRO json_typeof(j) AS json_type(j)",
+		"CREATE MACRO jsonb_typeof(j) AS json_type(j)",
+		"CREATE MACRO json_object_keys(j) AS json_keys(j)",
+		"CREATE MACRO jsonb_object_keys(j) AS json_keys(j)",
+		"CREATE MACRO json_agg(x) AS json_group_array(x)",
+		"CREATE MACRO jsonb_agg(x) AS json_group_array(x)",
+		"CREATE MACRO json_object_agg(k, v) AS json_group_object(k, v)",
+		"CREATE MACRO jsonb_object_agg(k, v) AS json_group_object(k, v)",
+		"CREATE MACRO div(a, b) AS trunc(a / b)",
+		"CREATE MACRO clock_timestamp() AS now()",
+		"CREATE MACRO timeofday() AS CAST(now() AS varchar)",
+		`CREATE MACRO quote_literal(s) AS '''' || replace(s::varchar, '''', '''''') || ''''`,
+		`CREATE MACRO quote_nullable(s) AS CASE WHEN s IS NULL THEN 'NULL' ELSE '''' || replace(s::varchar, '''', '''''') || '''' END`,
+		"CREATE MACRO array_remove(arr, elem) AS list_filter(arr, x -> x IS DISTINCT FROM elem)",
+		"CREATE MACRO array_replace(arr, from_elem, to_elem) AS list_transform(arr, x -> CASE WHEN x IS NOT DISTINCT FROM from_elem THEN to_elem ELSE x END)",
+		"CREATE MACRO array_positions(arr, elem) AS list_filter(generate_series(1, len(arr)), i -> arr[i] IS NOT DISTINCT FROM elem)",
+		// BemiDB-synced arrays are always one-dimensional
+		"CREATE MACRO array_ndims(arr) AS CASE WHEN arr IS NULL THEN NULL ELSE 1 END",
+		`CREATE MACRO array_dims(arr) AS '[1:' || len(arr)::varchar || ']'`,
+		// Capitalizes space-separated words (PG also splits on other non-alpha chars)
+		"CREATE MACRO initcap(s) AS array_to_string(list_transform(string_split(s, ' '), w -> upper(w[1]) || lower(w[2:])), ' ')",
+
 		// Table functions
 		"CREATE MACRO pg_is_in_recovery() AS TABLE SELECT false AS pg_is_in_recovery",
 		`CREATE MACRO pg_show_all_settings() AS TABLE SELECT
@@ -151,9 +178,19 @@ func (remapper *QueryRemapperFunction) RemapFunctionCall(functionCall *pgQuery.F
 		remapper.parserFunction.RemapFormatToPrintf(functionCall)
 		return schemaFunction
 
-	// encode(sha256(...), 'hex') -> sha256(...)
+	// encode(sha256(...), 'hex') -> sha256(...), encode(x, 'hex') -> lower(hex(x))
 	case schemaFunction.Function == PG_FUNCTION_ENCODE:
-		remapper.parserFunction.RemoveEncode(functionCall)
+		remapper.parserFunction.RemapEncode(functionCall)
+		return schemaFunction
+
+	// decode(x, 'hex') -> unhex(x), decode(x, 'base64') -> from_base64(x)
+	case schemaFunction.Function == PG_FUNCTION_DECODE:
+		remapper.parserFunction.RemapDecode(functionCall)
+		return schemaFunction
+
+	// cardinality(array) -> len(array) (DuckDB's cardinality only works on MAPs)
+	case schemaFunction.Function == PG_FUNCTION_CARDINALITY:
+		remapper.parserFunction.RemapToFunction(functionCall, "len")
 		return schemaFunction
 
 	// bemidb_last_synced_at('schema.table') -> to_timestamp(internalTableMetadata.LastSyncedAt)

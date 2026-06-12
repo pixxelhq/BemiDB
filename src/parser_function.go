@@ -76,35 +76,67 @@ func (parser *ParserFunction) RemapFormatToPrintf(functionCall *pgQuery.FuncCall
 	return functionCall
 }
 
-// encode(sha256(...), 'hex') -> sha256(...)
-func (parser *ParserFunction) RemoveEncode(functionCall *pgQuery.FuncCall) {
+// encode(sha256(...), 'hex') -> sha256(...) (DuckDB's sha256 already returns hex)
+// encode(value, 'hex') -> lower(hex(value))
+// encode(value, 'base64') -> base64(value)
+func (parser *ParserFunction) RemapEncode(functionCall *pgQuery.FuncCall) {
 	if len(functionCall.Args) != 2 {
 		return
 	}
 
+	format := parser.constStringValue(functionCall.Args[1])
 	firstArg := functionCall.Args[0]
-	nestedFunctionCall := firstArg.GetFuncCall()
-	if nestedFunctionCall == nil {
-		return
+
+	if nestedFunctionCall := firstArg.GetFuncCall(); nestedFunctionCall != nil && format == "hex" {
+		schemaFunction := parser.utils.SchemaFunction(nestedFunctionCall)
+		if schemaFunction.Function == "sha256" {
+			functionCall.Funcname = nestedFunctionCall.Funcname
+			functionCall.Args = nestedFunctionCall.Args
+			return
+		}
 	}
-	schemaFunction := parser.utils.SchemaFunction(nestedFunctionCall)
-	if schemaFunction.Function != "sha256" {
+
+	switch format {
+	case "hex":
+		hexCall := pgQuery.MakeFuncCallNode([]*pgQuery.Node{pgQuery.MakeStrNode("hex")}, []*pgQuery.Node{firstArg}, 0)
+		functionCall.Funcname = []*pgQuery.Node{pgQuery.MakeStrNode("lower")}
+		functionCall.Args = []*pgQuery.Node{hexCall}
+	case "base64":
+		functionCall.Funcname = []*pgQuery.Node{pgQuery.MakeStrNode("base64")}
+		functionCall.Args = []*pgQuery.Node{firstArg}
+	}
+}
+
+// decode(string, 'hex') -> unhex(string)
+// decode(string, 'base64') -> from_base64(string)
+func (parser *ParserFunction) RemapDecode(functionCall *pgQuery.FuncCall) {
+	if len(functionCall.Args) != 2 {
 		return
 	}
 
-	secondArg := functionCall.Args[1]
-	var format string
-	if secondArg.GetAConst() != nil {
-		format = secondArg.GetAConst().GetSval().Sval
-	} else if secondArg.GetTypeCast() != nil {
-		format = secondArg.GetTypeCast().Arg.GetAConst().GetSval().Sval
+	switch parser.constStringValue(functionCall.Args[1]) {
+	case "hex":
+		functionCall.Funcname = []*pgQuery.Node{pgQuery.MakeStrNode("unhex")}
+		functionCall.Args = functionCall.Args[:1]
+	case "base64":
+		functionCall.Funcname = []*pgQuery.Node{pgQuery.MakeStrNode("from_base64")}
+		functionCall.Args = functionCall.Args[:1]
 	}
-	if format != "hex" {
-		return
-	}
+}
 
-	functionCall.Funcname = nestedFunctionCall.Funcname
-	functionCall.Args = nestedFunctionCall.Args
+// FUNCTION(...) -> NEW_FUNCTION(...)
+func (parser *ParserFunction) RemapToFunction(functionCall *pgQuery.FuncCall, name string) {
+	functionCall.Funcname = []*pgQuery.Node{pgQuery.MakeStrNode(name)}
+}
+
+func (parser *ParserFunction) constStringValue(node *pgQuery.Node) string {
+	if node.GetAConst() != nil {
+		return node.GetAConst().GetSval().Sval
+	}
+	if typeCast := node.GetTypeCast(); typeCast != nil && typeCast.Arg.GetAConst() != nil {
+		return typeCast.Arg.GetAConst().GetSval().Sval
+	}
+	return ""
 }
 
 // to_timestamp(...)
