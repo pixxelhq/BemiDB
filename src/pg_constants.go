@@ -9,6 +9,9 @@ const (
 	PG_FUNCTION_ENCODE      = "encode"
 	PG_FUNCTION_DECODE      = "decode"
 	PG_FUNCTION_CARDINALITY = "cardinality"
+	PG_FUNCTION_TO_CHAR     = "to_char"
+	PG_FUNCTION_TO_DATE     = "to_date"
+	PG_FUNCTION_TO_TIMESTAMP = "to_timestamp"
 
 	PG_TABLE_PG_CLASS            = "pg_class"
 	PG_TABLE_PG_STAT_USER_TABLES = "pg_stat_user_tables"

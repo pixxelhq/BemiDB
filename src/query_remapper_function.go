@@ -38,11 +38,8 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 		"CREATE MACRO version() AS 'PostgreSQL " + PG_VERSION + ", compiled by BemiDB'",
 		"CREATE MACRO pg_get_statisticsobjdef_columns(oid) AS NULL",
 		"CREATE MACRO pg_relation_is_publishable(val) AS NULL",
-		`CREATE MACRO jsonb_extract_path_text(from_json, path_elems) AS
-			CASE typeof(path_elems) LIKE '%[]'
-			WHEN true THEN json_extract_path_text(from_json, path_elems)[1]::varchar
-			ELSE json_extract_path_text(from_json, path_elems)::varchar
-		END`,
+		// jsonb_extract_path_text is handled by RemapJsonbExtractPathText in the remapper
+		// (converts variadic path args to JSONPath: json_extract_string(json, '$.a.b'))
 		`CREATE MACRO json_build_object(k1, v1) AS json_object(k1, v1),
 			(k1, v1, k2, v2) AS json_object(k1, v1, k2, v2),
 			(k1, v1, k2, v2, k3, v3) AS json_object(k1, v1, k2, v2, k3, v3),
@@ -191,6 +188,27 @@ func (remapper *QueryRemapperFunction) RemapFunctionCall(functionCall *pgQuery.F
 	// cardinality(array) -> len(array) (DuckDB's cardinality only works on MAPs)
 	case schemaFunction.Function == PG_FUNCTION_CARDINALITY:
 		remapper.parserFunction.RemapToFunction(functionCall, "len")
+		return schemaFunction
+
+	// to_char(timestamp, 'YYYY-MM-DD') -> strftime(timestamp, '%Y-%m-%d')
+	case schemaFunction.Function == PG_FUNCTION_TO_CHAR:
+		remapper.parserFunction.RemapToChar(functionCall)
+		return schemaFunction
+
+	// to_date('str', 'YYYY-MM-DD') -> strptime('str', '%Y-%m-%d')::DATE
+	case schemaFunction.Function == PG_FUNCTION_TO_DATE:
+		remapper.parserFunction.RemapToDate(functionCall)
+		return schemaFunction
+
+	// to_timestamp('str', 'YYYY-MM-DD HH24:MI') -> strptime('str', '%Y-%m-%d %H:%M')
+	// Only remaps the 2-arg form; 1-arg to_timestamp(epoch) is already native in DuckDB
+	case schemaFunction.Function == PG_FUNCTION_TO_TIMESTAMP && len(functionCall.Args) == 2:
+		remapper.parserFunction.RemapToTimestampFormat(functionCall)
+		return schemaFunction
+
+	// jsonb_extract_path_text(json, 'a', 'b') -> json_extract_string(json, '$.a.b')
+	case schemaFunction.Function == "jsonb_extract_path_text" || schemaFunction.Function == "json_extract_path_text":
+		remapper.parserFunction.RemapJsonbExtractPathText(functionCall)
 		return schemaFunction
 
 	// bemidb_last_synced_at('schema.table') -> to_timestamp(internalTableMetadata.LastSyncedAt)

@@ -372,6 +372,12 @@ func (remapper *QueryRemapper) remappedExpressions(node *pgQuery.Node, indentLev
 		}
 	}
 
+	// value::type or CAST(value AS type) — recurse into the argument so
+	// functions inside casts (e.g., CAST(to_char(...) AS int)) get remapped
+	if typeCast := node.GetTypeCast(); typeCast != nil && typeCast.Arg != nil {
+		typeCast.Arg = remapper.remappedExpressions(typeCast.Arg, indentLevel+1)
+	}
+
 	return remapper.remapperExpression.RemappedExpression(node)
 }
 
