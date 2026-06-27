@@ -135,18 +135,23 @@ func (syncer *Syncer) SyncFromPostgres() {
 }
 
 const MAX_RECOVERY_CONFLICT_RETRIES = 3
+const RECOVERY_CONFLICT_RETRY_BACKOFF = 15 * time.Second
 
 // syncTableWithRetry wraps SyncPgTable with retry logic for hot standby
 // recovery conflicts (SQLSTATE 40001), snapshot invalidation, and connection
-// termination. Returns the (possibly reconnected) structureConn and snapshotID
-// so the caller can use them for subsequent tables.
+// termination. Between retries it backs off (so the standby can catch up on WAL
+// replay) and re-reads the table's persisted checkpoint, so a retry resumes from
+// the in-progress xmin watermark (reading a smaller "WHERE xmin > MaxXmin" window)
+// instead of restarting the full table scan. Returns the (possibly reconnected)
+// structureConn and snapshotID so the caller can use them for subsequent tables.
 func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, databaseUrl string, snapshotID string, internalTableMetadata InternalTableMetadata, incrementalRefresh bool) (*pgx.Conn, string, error) {
 	currentCopyConn := copyConn
 	currentStructureConn := structureConn
 	currentSnapshotID := snapshotID
+	currentMetadata := internalTableMetadata
 
 	for attempt := 0; attempt <= MAX_RECOVERY_CONFLICT_RETRIES; attempt++ {
-		err := syncer.syncerTable.SyncPgTable(pgSchemaTable, currentStructureConn, currentCopyConn, internalTableMetadata, incrementalRefresh)
+		err := syncer.syncerTable.SyncPgTable(pgSchemaTable, currentStructureConn, currentCopyConn, currentMetadata, incrementalRefresh)
 		if err == nil {
 			return currentStructureConn, currentSnapshotID, nil
 		}
@@ -196,6 +201,20 @@ func (syncer *Syncer) syncTableWithRetry(ctx context.Context, pgSchemaTable PgSc
 				currentCopyConn.Close(ctx)
 			}
 			currentCopyConn = syncer.newConnectionWithSnapshot(ctx, databaseUrl, currentSnapshotID)
+
+			// Resume from the checkpoint the failed attempt persisted (if any) so the
+			// retry reads "WHERE xmin > MaxXmin" instead of rescanning the whole table.
+			// Reads return an empty struct when no checkpoint exists; ignore read errors
+			// and fall back to the metadata we already have.
+			if refreshedMetadata, readErr := syncer.icebergReader.InternalTableMetadata(pgSchemaTable); readErr == nil && refreshedMetadata.MaxXmin != nil {
+				currentMetadata = refreshedMetadata
+			}
+
+			// Back off so the standby can replay pending WAL before the next attempt.
+			select {
+			case <-time.After(RECOVERY_CONFLICT_RETRY_BACKOFF):
+			case <-ctx.Done():
+			}
 			continue
 		}
 

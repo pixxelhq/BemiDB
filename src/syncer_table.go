@@ -105,11 +105,20 @@ func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureCon
 
 		for {
 			row, err := csvReader.Read()
-			if err == io.EOF {
-				reachedEnd = true
-				break
-			}
 			if err != nil {
+				// The capped buffer surfaces an error (io.EOF on a clean finish, or the
+				// COPY error if it was aborted) once it's closed and drained. Only a COPY
+				// that completed cleanly means we've truly reached the end of the table.
+				// If the COPY was aborted mid-stream, do NOT mark the refresh complete —
+				// leaving it in-progress preserves the resumable xmin checkpoint, and
+				// SyncPgTable surfaces the error from copyErrChan so the table is retried.
+				if cappedBuffer.CloseError() != nil {
+					break
+				}
+				if err == io.EOF {
+					reachedEnd = true
+					break
+				}
 				PanicIfError(syncer.config, err)
 			}
 
@@ -311,7 +320,10 @@ func (syncer *SyncerTable) pgTableSchemaColumns(conn *pgx.Conn, pgSchemaTable Pg
 func (syncer *SyncerTable) copyFromPgTable(copySql string, copyConn *pgx.Conn, cappedBuffer *CappedBuffer, waitGroup *sync.WaitGroup) error {
 	LogDebug(syncer.config, copySql)
 	result, err := copyConn.PgConn().CopyTo(context.Background(), cappedBuffer, copySql)
-	cappedBuffer.Close()
+	// Record WHY the buffer is closing. If the COPY was aborted mid-stream (e.g. a
+	// hot-standby recovery conflict), the reader must see this error instead of a
+	// clean io.EOF, otherwise it would treat the partial data as a complete table.
+	cappedBuffer.CloseWithError(err)
 	waitGroup.Done()
 	if err != nil {
 		return err

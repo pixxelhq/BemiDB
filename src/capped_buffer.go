@@ -16,6 +16,7 @@ type CappedBuffer struct {
 
 	closeOnceSync sync.Once
 	closed        bool
+	closeErr      error
 }
 
 func NewCappedBuffer(maxSizeBytes int, config *Config) *CappedBuffer {
@@ -75,6 +76,13 @@ func (buf *CappedBuffer) Read(payload []byte) (readBytes int, err error) {
 	}
 
 	if len(buf.buffer) == 0 && buf.closed {
+		// Once drained, surface the reason the buffer was closed. A clean Close()
+		// means we genuinely reached the end of the data (io.EOF). A CloseWithError()
+		// (e.g. the COPY was aborted mid-stream by a hot-standby recovery conflict)
+		// must NOT look like a clean end, otherwise callers commit partial data as complete.
+		if buf.closeErr != nil {
+			return 0, buf.closeErr
+		}
 		return 0, io.EOF
 	}
 
@@ -89,10 +97,19 @@ func (buf *CappedBuffer) Read(payload []byte) (readBytes int, err error) {
 }
 
 func (buf *CappedBuffer) Close() error {
+	return buf.CloseWithError(nil)
+}
+
+// CloseWithError closes the buffer and records why. Readers drain any remaining
+// buffered data first, then receive err (or io.EOF when err is nil). The error is
+// set before waking readers, so a reader that observes the buffer as closed always
+// sees the final close reason — no race with the goroutine producing the data.
+func (buf *CappedBuffer) CloseWithError(err error) error {
 	buf.closeOnceSync.Do(func() {
 		buf.mutex.Lock()
 
 		LogTrace(buf.config, "== Closing capped buffer...")
+		buf.closeErr = err
 		buf.closed = true
 
 		buf.conditionalSync.Broadcast() // Wake up any waiting writers/readers
@@ -100,4 +117,12 @@ func (buf *CappedBuffer) Close() error {
 		buf.mutex.Unlock()
 	})
 	return nil
+}
+
+// CloseError returns the error the buffer was closed with, or nil for a clean close
+// (or while still open).
+func (buf *CappedBuffer) CloseError() error {
+	buf.mutex.Lock()
+	defer buf.mutex.Unlock()
+	return buf.closeErr
 }

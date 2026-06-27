@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -315,6 +316,84 @@ func TestCappedBufferConcurrentReadWrite(t *testing.T) {
 		readBytes3, _ := buffer.Read(readData3)
 		if readBytes3 != 5 || string(readData3) != "third" {
 			t.Errorf("Third read failed: got %q, want %q", readData3, "third")
+		}
+	})
+}
+
+func TestCappedBufferCloseWithError(t *testing.T) {
+	t.Run("Returns the close error when reading from a buffer closed with an error", func(t *testing.T) {
+		config := initTestConfig()
+		buffer := NewCappedBuffer(100, config)
+		closeErr := errors.New("canceling statement due to conflict with recovery")
+
+		buffer.CloseWithError(closeErr)
+
+		readData := make([]byte, 10)
+		readBytes, err := buffer.Read(readData)
+
+		if err != closeErr {
+			t.Errorf("Read from buffer closed with error should return that error, but got: %v", err)
+		}
+		if readBytes != 0 {
+			t.Errorf("Expected to read 0 bytes, but read %d", readBytes)
+		}
+	})
+
+	t.Run("Delivers buffered data before surfacing the close error", func(t *testing.T) {
+		config := initTestConfig()
+		buffer := NewCappedBuffer(100, config)
+		closeErr := errors.New("copy aborted")
+
+		buffer.Write([]byte("partial"))
+		buffer.CloseWithError(closeErr)
+
+		// The already-buffered data must still be readable first.
+		readData := make([]byte, 10)
+		readBytes, err := buffer.Read(readData)
+		if err != nil {
+			t.Errorf("First read should return buffered data without error, but got: %v", err)
+		}
+		if string(readData[:readBytes]) != "partial" {
+			t.Errorf("First read got %q, want %q", readData[:readBytes], "partial")
+		}
+
+		// Once drained, the close error surfaces (NOT io.EOF).
+		readBytes, err = buffer.Read(readData)
+		if err != closeErr {
+			t.Errorf("Read after draining a buffer closed with error should return that error, but got: %v", err)
+		}
+		if readBytes != 0 {
+			t.Errorf("Expected to read 0 bytes, but read %d", readBytes)
+		}
+	})
+
+	t.Run("CloseError reports nil after a clean Close and the error after CloseWithError", func(t *testing.T) {
+		config := initTestConfig()
+
+		cleanBuffer := NewCappedBuffer(100, config)
+		cleanBuffer.Close()
+		if cleanBuffer.CloseError() != nil {
+			t.Errorf("CloseError after a clean Close should be nil, but got: %v", cleanBuffer.CloseError())
+		}
+
+		closeErr := errors.New("copy aborted")
+		erroredBuffer := NewCappedBuffer(100, config)
+		erroredBuffer.CloseWithError(closeErr)
+		if erroredBuffer.CloseError() != closeErr {
+			t.Errorf("CloseError should report the close error, but got: %v", erroredBuffer.CloseError())
+		}
+	})
+
+	t.Run("A clean Close still returns io.EOF on an empty buffer", func(t *testing.T) {
+		config := initTestConfig()
+		buffer := NewCappedBuffer(100, config)
+
+		buffer.Close()
+
+		readData := make([]byte, 10)
+		_, err := buffer.Read(readData)
+		if err != io.EOF {
+			t.Errorf("Read from a cleanly closed empty buffer should return io.EOF, but got: %v", err)
 		}
 	})
 }
