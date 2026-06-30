@@ -605,14 +605,20 @@ func (storage *StorageUtils) NewDuckDBIfHasOverlappingRows(fileSystemPrefix stri
 		return nil, err
 	}
 
+	existingColumnNames := storage.existingColumnNames(duckdb)
 	var pkColumnNames []string
+	var columnNames []string
 	for _, pgSchemaColumn := range pgSchemaColumns {
+		if !existingColumnNames.Contains(pgSchemaColumn.ColumnName) {
+			continue
+		}
 		if pgSchemaColumn.PartOfPrimaryKey {
 			pkColumnNames = append(pkColumnNames, pgSchemaColumn.ColumnName)
 		}
+		columnNames = append(columnNames, pgSchemaColumn.ColumnName)
 	}
 
-	hasOverlappingRows, err := storage.hasOverlappingRows(pkColumnNames, duckdb)
+	hasOverlappingRows, err := storage.hasOverlappingRows(columnNames, pkColumnNames, duckdb)
 	if err != nil {
 		return nil, err
 	}
@@ -1206,11 +1212,8 @@ func (storage *StorageUtils) existingColumnNames(duckdb *Duckdb) Set[string] {
 	return NewSet(columns)
 }
 
-func (storage *StorageUtils) hasOverlappingRows(pkColumnNames []string, duckdb *Duckdb) (bool, error) {
-	sql := "SELECT 1 FROM existing_parquet JOIN new_parquet USING (" + strings.Join(pkColumnNames, ", ") + ") LIMIT 1"
-	if len(pkColumnNames) == 0 {
-		sql = "SELECT 1 FROM existing_parquet JOIN new_parquet LIMIT 1"
-	}
+func (storage *StorageUtils) hasOverlappingRows(columnNames []string, pkColumnNames []string, duckdb *Duckdb) (bool, error) {
+	sql := storage.overlappingRowsSql(columnNames, pkColumnNames)
 
 	ctx := context.Background()
 	rows, err := duckdb.QueryContext(ctx, sql)
@@ -1222,21 +1225,38 @@ func (storage *StorageUtils) hasOverlappingRows(pkColumnNames []string, duckdb *
 	return rows.Next(), nil
 }
 
+// rowMatchConditions builds the predicate matching an existing_parquet row to a
+// new_parquet row, shared by the overlap pre-check and the overwrite so they always
+// agree. With a primary key it matches on the PK with "=". Without one it falls back
+// to all columns and uses NULL-safe equality (IS NOT DISTINCT FROM) so rows that
+// contain NULLs still dedup — plain "=" treats NULL = NULL as false and would leave
+// duplicates. This also avoids the invalid "JOIN ... LIMIT" SQL DuckDB rejects for
+// keyless tables.
+func (storage *StorageUtils) rowMatchConditions(columnNames []string, pkColumnNames []string) []string {
+	conditions := []string{}
+	if len(pkColumnNames) == 0 {
+		for _, columnName := range columnNames {
+			conditions = append(conditions, "existing_parquet."+columnName+" IS NOT DISTINCT FROM new_parquet."+columnName)
+		}
+	} else {
+		for _, pkColumnName := range pkColumnNames {
+			conditions = append(conditions, "existing_parquet."+pkColumnName+" = new_parquet."+pkColumnName)
+		}
+	}
+	return conditions
+}
+
+func (storage *StorageUtils) overlappingRowsSql(columnNames []string, pkColumnNames []string) string {
+	conditions := storage.rowMatchConditions(columnNames, pkColumnNames)
+	return "SELECT 1 FROM existing_parquet WHERE EXISTS (SELECT 1 FROM new_parquet WHERE " + strings.Join(conditions, " AND ") + ") LIMIT 1"
+}
+
 func (storage *StorageUtils) selectNonOverlappingRowsSql(columnNames []string, pkColumnNames []string) string {
 	selectExpressions := []string{}
 	for _, columnName := range columnNames {
 		selectExpressions = append(selectExpressions, "\""+columnName+"\""+" := existing_parquet."+columnName)
 	}
-	whereConditions := []string{}
-	if len(pkColumnNames) == 0 {
-		for _, columnName := range columnNames {
-			whereConditions = append(whereConditions, "existing_parquet."+columnName+" = new_parquet."+columnName)
-		}
-	} else {
-		for _, pkColumnName := range pkColumnNames {
-			whereConditions = append(whereConditions, "existing_parquet."+pkColumnName+" = new_parquet."+pkColumnName)
-		}
-	}
+	whereConditions := storage.rowMatchConditions(columnNames, pkColumnNames)
 	return "SELECT to_json(struct_pack(" + strings.Join(selectExpressions, ", ") + ")) FROM existing_parquet WHERE NOT EXISTS (SELECT 1 FROM new_parquet WHERE " + strings.Join(whereConditions, " AND ") + ")"
 }
 
