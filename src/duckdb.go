@@ -76,6 +76,22 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 		PanicIfError(config, err)
 	}
 
+	// Point DuckDB at a temp directory so larger-than-memory operations (joins,
+	// aggregates, sorts, and the sync merge) spill to disk instead of erroring.
+	if config.DuckDbTempDirectory != "" {
+		_, err = duckdb.ExecContext(ctx, "SET temp_directory='"+config.DuckDbTempDirectory+"'", nil)
+		PanicIfError(config, err)
+	}
+
+	// Bound DuckDB memory. In-memory DuckDB defaults to ~80% of host RAM, which in a
+	// container ignores the cgroup limit and gets OOM-killed. With a limit set (below the
+	// container limit) DuckDB stays bounded and spills to temp_directory.
+	if config.DuckDbMemoryLimit != "" {
+		_, err = duckdb.ExecContext(ctx, "SET memory_limit='"+config.DuckDbMemoryLimit+"'", nil)
+		PanicIfError(config, err)
+		LogInfo(config, "DuckDB: memory_limit set to", config.DuckDbMemoryLimit, "(temp_directory:", config.DuckDbTempDirectory+")")
+	}
+
 	if config.EnableCache {
 		_, err = duckdb.ExecContext(ctx, "SET enable_object_cache=true", nil)
 		PanicIfError(config, err)
