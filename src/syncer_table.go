@@ -21,6 +21,15 @@ func NewSyncerTable(config *Config) *SyncerTable {
 	return &SyncerTable{config: config}
 }
 
+// parquetPayloadThreshold is the uncompressed payload per Parquet file before rolling
+// to a new one. Configurable via --parquet-payload-threshold-mb.
+func (syncer *SyncerTable) parquetPayloadThreshold() int {
+	if syncer.config.ParquetPayloadThresholdMb > 0 {
+		return syncer.config.ParquetPayloadThresholdMb * 1024 * 1024
+	}
+	return MAX_PARQUET_PAYLOAD_THRESHOLD
+}
+
 func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureConn *pgx.Conn, copyConn *pgx.Conn, existingInternalTableMetadata InternalTableMetadata, incrementalRefresh bool) error {
 	continuedRefresh := existingInternalTableMetadata.MaxXmin != nil &&
 		(incrementalRefresh || existingInternalTableMetadata.LastRefreshMode == RefreshModeFullInProgress)
@@ -87,7 +96,7 @@ func (syncer *SyncerTable) SyncPgTable(pgSchemaTable PgSchemaTable, structureCon
 		pgSchemaTable.ToIcebergSchemaTable(),
 		pgSchemaColumns,
 		dynamicRowCountPerBatch,
-		MAX_PARQUET_PAYLOAD_THRESHOLD,
+		syncer.parquetPayloadThreshold(),
 		continuedRefresh,
 	)
 

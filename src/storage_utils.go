@@ -544,6 +544,16 @@ func (storage *StorageUtils) ParseParquetFilePath(fileSystemPrefix string, manif
 
 // Write ---------------------------------------------------------------------------------------------------------------
 
+// parquetRowGroupSize is the in-memory buffer parquet-go holds before flushing a row
+// group. Smaller values cap peak memory when writing wide tables (at the cost of more,
+// smaller row groups). Configurable via --parquet-row-group-size-mb.
+func (storage *StorageUtils) parquetRowGroupSize() int64 {
+	if storage.config.ParquetRowGroupSizeMb > 0 {
+		return int64(storage.config.ParquetRowGroupSizeMb) * 1024 * 1024
+	}
+	return PARQUET_ROW_GROUP_SIZE
+}
+
 func (storage *StorageUtils) WriteParquetFile(fileWriter source.ParquetFile, pgSchemaColumns []PgSchemaColumn, maxPayloadThreshold int, loadRows func() ([][]string, InternalTableMetadata)) (recordCount int64, internalTableMetadata InternalTableMetadata, err error) {
 	defer fileWriter.Close()
 
@@ -553,7 +563,7 @@ func (storage *StorageUtils) WriteParquetFile(fileWriter source.ParquetFile, pgS
 	if err != nil {
 		return recordCount, internalTableMetadata, fmt.Errorf("failed to create Parquet writer: %v", err)
 	}
-	parquetWriter.RowGroupSize = PARQUET_ROW_GROUP_SIZE
+	parquetWriter.RowGroupSize = storage.parquetRowGroupSize()
 	parquetWriter.PageSize = PARQUET_PAGE_SIZE
 	parquetWriter.CompressionType = PARQUET_COMPRESSION_TYPE
 
@@ -638,7 +648,7 @@ func (storage *StorageUtils) WriteOverwrittenParquetFile(duckdb *Duckdb, fileWri
 	if err != nil {
 		return 0, fmt.Errorf("failed to create Parquet writer: %v", err)
 	}
-	parquetWriter.RowGroupSize = PARQUET_ROW_GROUP_SIZE
+	parquetWriter.RowGroupSize = storage.parquetRowGroupSize()
 	parquetWriter.CompressionType = PARQUET_COMPRESSION_TYPE
 
 	existingColumnNames := storage.existingColumnNames(duckdb)

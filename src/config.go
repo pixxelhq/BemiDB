@@ -4,8 +4,16 @@ import (
 	"flag"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 )
+
+func intFromEnv(key string) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
+		return v
+	}
+	return 0
+}
 
 const (
 	VERSION = "0.51.1"
@@ -38,6 +46,9 @@ const (
 
 	ENV_DUCKDB_MEMORY_LIMIT   = "BEMIDB_DUCKDB_MEMORY_LIMIT"
 	ENV_DUCKDB_TEMP_DIRECTORY = "BEMIDB_DUCKDB_TEMP_DIRECTORY"
+
+	ENV_PARQUET_ROW_GROUP_SIZE_MB    = "BEMIDB_PARQUET_ROW_GROUP_SIZE_MB"
+	ENV_PARQUET_PAYLOAD_THRESHOLD_MB = "BEMIDB_PARQUET_PAYLOAD_THRESHOLD_MB"
 
 	ENV_LOG_LEVEL                   = "BEMIDB_LOG_LEVEL"
 	ENV_DISABLE_ANONYMOUS_ANALYTICS = "BEMIDB_DISABLE_ANONYMOUS_ANALYTICS"
@@ -87,6 +98,8 @@ type Config struct {
 	EnableHttpConnectionCache bool
 	DuckDbMemoryLimit         string
 	DuckDbTempDirectory       string
+	ParquetRowGroupSizeMb     int
+	ParquetPayloadThresholdMb int
 	LogLevel                  string
 	StorageType               string
 	StoragePath               string
@@ -119,6 +132,8 @@ func registerFlags() {
 	flag.BoolVar(&_config.EnableHttpConnectionCache, "enable-http-connection-cache", os.Getenv(ENV_ENABLE_HTTP_CONNECTION_CACHE) == "true", "Enable DuckDB HTTP connection keep-alive for remote files. Default: false")
 	flag.StringVar(&_config.DuckDbMemoryLimit, "duckdb-memory-limit", os.Getenv(ENV_DUCKDB_MEMORY_LIMIT), "(Optional) DuckDB memory_limit, e.g. \"4GB\". Bounds DuckDB memory; it spills to the temp directory when exceeded. Set below the container memory limit.")
 	flag.StringVar(&_config.DuckDbTempDirectory, "duckdb-temp-directory", os.Getenv(ENV_DUCKDB_TEMP_DIRECTORY), "(Optional) DuckDB temp_directory for spilling to disk. Defaults to the OS temp dir so a memory limit can spill instead of erroring.")
+	flag.IntVar(&_config.ParquetRowGroupSizeMb, "parquet-row-group-size-mb", intFromEnv(ENV_PARQUET_ROW_GROUP_SIZE_MB), "(Optional) Parquet row group size in MB. Smaller values cap the in-memory write buffer. Default: 128")
+	flag.IntVar(&_config.ParquetPayloadThresholdMb, "parquet-payload-threshold-mb", intFromEnv(ENV_PARQUET_PAYLOAD_THRESHOLD_MB), "(Optional) Uncompressed payload (MB) per Parquet file before rolling to a new file. Default: 2048")
 	flag.StringVar(&_config.StoragePath, "storage-path", os.Getenv(ENV_STORAGE_PATH), "Path to the storage folder. Default: \""+DEFAULT_STORAGE_PATH+"\"")
 	flag.StringVar(&_config.LogLevel, "log-level", os.Getenv(ENV_LOG_LEVEL), "Log level: \"ERROR\", \"WARN\", \"INFO\", \"DEBUG\", \"TRACE\". Default: \""+DEFAULT_LOG_LEVEL+"\"")
 	flag.StringVar(&_config.StorageType, "storage-type", os.Getenv(ENV_STORAGE_TYPE), "Storage type: \"LOCAL\", \"S3\". Default: \""+DEFAULT_DB_STORAGE_TYPE+"\"")
