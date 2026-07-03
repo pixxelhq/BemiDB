@@ -127,12 +127,18 @@ func (writer *IcebergWriterTable) overwriteExistingFiles(
 	originalExistingManifestListItemsSortedAsc := Reverse(originalExistingManifestListItemsSortedDesc)
 	lastSequenceNumber = originalLastSequenceNumber
 
+	// One DuckDB is reused for every existing file (with new_parquet loaded once) so the
+	// merge's memory stays bounded instead of growing with the number of files.
+	duckdb, err := writer.storage.NewMergeDuckdb(newParquetFile.Path)
+	PanicIfError(writer.config, err)
+	defer duckdb.Close()
+
 	for i, existingManifestListItem := range originalExistingManifestListItemsSortedAsc {
 		existingManifestFile := existingManifestListItem.ManifestFile
 		existingParquetFilePath, err := writer.storage.ExistingParquetFilePath(existingManifestFile)
 		PanicIfError(writer.config, err)
 
-		overwrittenParquetFile, err := writer.storage.CreateOverwrittenParquet(dataDirPath, existingParquetFilePath, newParquetFile.Path, writer.pgSchemaColumns, writer.dynamicRowCountPerBatch)
+		overwrittenParquetFile, err := writer.storage.CreateOverwrittenParquet(duckdb, dataDirPath, existingParquetFilePath, writer.pgSchemaColumns, writer.dynamicRowCountPerBatch)
 		PanicIfError(writer.config, err)
 
 		// Keep as is if no overlapping records found

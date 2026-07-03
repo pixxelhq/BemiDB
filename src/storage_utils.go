@@ -601,23 +601,37 @@ func (storage *StorageUtils) WriteParquetFile(fileWriter source.ParquetFile, pgS
 	return recordCount, lastInternalTableMetadata, nil
 }
 
-func (storage *StorageUtils) NewDuckDBIfHasOverlappingRows(fileSystemPrefix string, existingParquetFilePath string, newParquetFilePath string, pgSchemaColumns []PgSchemaColumn) (*Duckdb, error) {
+// NewMergeDuckdb creates a DuckDB for the resume merge and loads the new Parquet file
+// once as a view. The same DuckDB is reused for every existing file so memory stays
+// bounded instead of growing with the number of files (each new instance would keep
+// its own cgo memory, which OOMs when there are many small files).
+func (storage *StorageUtils) NewMergeDuckdb(fileSystemPrefix string, newParquetFilePath string) (*Duckdb, error) {
 	duckdb := NewDuckdb(storage.config, false)
-
-	ctx := context.Background()
-	_, err := duckdb.ExecContext(ctx, "CREATE TABLE existing_parquet AS SELECT * FROM read_parquet('"+fileSystemPrefix+existingParquetFilePath+"')", nil)
+	_, err := duckdb.ExecContext(context.Background(), "CREATE VIEW new_parquet AS SELECT * FROM read_parquet('"+fileSystemPrefix+newParquetFilePath+"')", nil)
 	if err != nil {
+		duckdb.Close()
 		return nil, err
 	}
+	return duckdb, nil
+}
 
-	_, err = duckdb.ExecContext(ctx, "CREATE TABLE new_parquet AS SELECT * FROM read_parquet('"+fileSystemPrefix+newParquetFilePath+"')", nil)
+// HasOverlappingRows points existing_parquet at the given existing file (as a view, so
+// DuckDB streams it on demand instead of materializing the whole file in memory) and
+// reports whether any of its rows also appear in new_parquet.
+func (storage *StorageUtils) HasOverlappingRows(duckdb *Duckdb, fileSystemPrefix string, existingParquetFilePath string, pgSchemaColumns []PgSchemaColumn) (bool, error) {
+	_, err := duckdb.ExecContext(context.Background(), "CREATE OR REPLACE VIEW existing_parquet AS SELECT * FROM read_parquet('"+fileSystemPrefix+existingParquetFilePath+"')", nil)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 
+	columnNames, pkColumnNames := storage.mergeColumnNames(duckdb, pgSchemaColumns)
+	return storage.hasOverlappingRows(columnNames, pkColumnNames, duckdb)
+}
+
+// mergeColumnNames returns the columns present in existing_parquet, plus the subset that
+// form the primary key, in schema order.
+func (storage *StorageUtils) mergeColumnNames(duckdb *Duckdb, pgSchemaColumns []PgSchemaColumn) (columnNames []string, pkColumnNames []string) {
 	existingColumnNames := storage.existingColumnNames(duckdb)
-	var pkColumnNames []string
-	var columnNames []string
 	for _, pgSchemaColumn := range pgSchemaColumns {
 		if !existingColumnNames.Contains(pgSchemaColumn.ColumnName) {
 			continue
@@ -627,16 +641,7 @@ func (storage *StorageUtils) NewDuckDBIfHasOverlappingRows(fileSystemPrefix stri
 		}
 		columnNames = append(columnNames, pgSchemaColumn.ColumnName)
 	}
-
-	hasOverlappingRows, err := storage.hasOverlappingRows(columnNames, pkColumnNames, duckdb)
-	if err != nil {
-		return nil, err
-	}
-
-	if hasOverlappingRows {
-		return duckdb, nil
-	}
-	return nil, nil
+	return columnNames, pkColumnNames
 }
 
 func (storage *StorageUtils) WriteOverwrittenParquetFile(duckdb *Duckdb, fileWriter source.ParquetFile, pgSchemaColumns []PgSchemaColumn, dynamicRowCountPerBatch int) (recordCount int64, err error) {
@@ -651,18 +656,7 @@ func (storage *StorageUtils) WriteOverwrittenParquetFile(duckdb *Duckdb, fileWri
 	parquetWriter.RowGroupSize = storage.parquetRowGroupSize()
 	parquetWriter.CompressionType = PARQUET_COMPRESSION_TYPE
 
-	existingColumnNames := storage.existingColumnNames(duckdb)
-	var pkColumnNames []string
-	var columnNames []string
-	for _, pgSchemaColumn := range pgSchemaColumns {
-		if !existingColumnNames.Contains(pgSchemaColumn.ColumnName) {
-			continue
-		}
-		if pgSchemaColumn.PartOfPrimaryKey {
-			pkColumnNames = append(pkColumnNames, pgSchemaColumn.ColumnName)
-		}
-		columnNames = append(columnNames, pgSchemaColumn.ColumnName)
-	}
+	columnNames, pkColumnNames := storage.mergeColumnNames(duckdb, pgSchemaColumns)
 
 	batch := 0
 	ctx := context.Background()
