@@ -261,6 +261,10 @@ func (syncer *SyncerTable) pgTableSchemaColumns(conn *pgx.Conn, pgSchemaTable Pg
 
 	var pgSchemaColumns []PgSchemaColumn
 
+	// PKs come from pg_catalog, not information_schema: table_constraints and
+	// key_column_usage omit tables where the user has only SELECT privilege
+	// (per SQL standard), so a read-only sync user would detect no PK and fall
+	// back to the slow keyless all-column merge.
 	rows, err := conn.Query(
 		context.Background(),
 		`SELECT
@@ -274,23 +278,18 @@ func (syncer *SyncerTable) pgTableSchemaColumns(conn *pgx.Conn, pgSchemaTable Pg
 			COALESCE(columns.numeric_scale, 0),
 			COALESCE(columns.datetime_precision, 0),
 			pg_namespace.nspname,
-			CASE WHEN pk.constraint_name IS NOT NULL THEN true ELSE false END
+			CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END
 		FROM information_schema.columns
 		JOIN pg_type ON pg_type.typname = columns.udt_name
 		JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
 		LEFT JOIN (
-			SELECT
-				tc.constraint_name,
-				kcu.column_name,
-				kcu.table_schema,
-				kcu.table_name
-			FROM information_schema.table_constraints tc
-			JOIN information_schema.key_column_usage kcu
-				ON tc.constraint_name = kcu.constraint_name
-				AND tc.table_schema = kcu.table_schema
-				AND tc.table_name = kcu.table_name
-			WHERE tc.constraint_type = 'PRIMARY KEY'
-		) pk ON pk.column_name = columns.column_name AND pk.table_schema = columns.table_schema AND pk.table_name = columns.table_name
+			SELECT pg_attribute.attname AS column_name
+			FROM pg_constraint
+			JOIN pg_class AS pk_class ON pk_class.oid = pg_constraint.conrelid
+			JOIN pg_namespace AS pk_namespace ON pk_namespace.oid = pk_class.relnamespace
+			JOIN pg_attribute ON pg_attribute.attrelid = pg_constraint.conrelid AND pg_attribute.attnum = ANY(pg_constraint.conkey)
+			WHERE pg_constraint.contype = 'p' AND pk_namespace.nspname = $1 AND pk_class.relname = $2
+		) pk ON pk.column_name = columns.column_name
 		WHERE columns.table_schema = $1 AND columns.table_name = $2
 		ORDER BY array_position($3, columns.column_name)`,
 		pgSchemaTable.Schema,
