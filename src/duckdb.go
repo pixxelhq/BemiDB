@@ -92,6 +92,15 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 		LogInfo(config, "DuckDB: memory_limit set to", config.DuckDbMemoryLimit, "(temp_directory:", config.DuckDbTempDirectory+")")
 	}
 
+	// Cap DuckDB parallelism. Threads default to all host cores — the node's, not the
+	// container's, since cgroup CPU limits are ignored — and peak scan memory grows with
+	// every worker holding its own decompressed row-group chunks.
+	if config.DuckDbThreads > 0 {
+		_, err = duckdb.ExecContext(ctx, "SET threads="+IntToString(config.DuckDbThreads), nil)
+		PanicIfError(config, err)
+		LogInfo(config, "DuckDB: threads set to", config.DuckDbThreads)
+	}
+
 	if config.EnableCache {
 		_, err = duckdb.ExecContext(ctx, "SET enable_object_cache=true", nil)
 		PanicIfError(config, err)
