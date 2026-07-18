@@ -45,6 +45,11 @@ func TestRunDoesNotPanicOnErrorBeforeSync(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer clientConn.Close()
+	// Bound every read/write: without a deadline, a server that wedges before
+	// replying leaves frontend.Receive() blocked until go test's global timeout.
+	if err := clientConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
 
 	frontend := pgproto3.NewFrontend(clientConn, clientConn)
 	frontend.Send(&pgproto3.StartupMessage{
@@ -93,7 +98,8 @@ func TestRunDoesNotPanicOnErrorBeforeSync(t *testing.T) {
 	}
 
 	// The connection loop must still be alive and serving: a Terminate ends it
-	// cleanly and Run returns (a crashed goroutine would never close done).
+	// cleanly and Run returns. (A regression panic would crash the whole test
+	// process outright; the timeout below guards the wedged-but-alive case.)
 	frontend.Send(&pgproto3.Terminate{})
 	_ = frontend.Flush()
 	select {

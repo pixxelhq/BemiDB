@@ -304,9 +304,11 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 			return nil, err
 		}
 		queryMessages = append(queryMessages, descriptionMessages...)
-		// Description messages accumulate into the same single-flush buffer as data
-		// rows, so they count against the shared budget too.
-		resultBytes += encodedMessagesBytes(descriptionMessages)
+		if queryHandler.config.MaxResultMb > 0 {
+			// Description messages accumulate into the same single-flush buffer as data
+			// rows, so they count against the shared budget too.
+			resultBytes += encodedMessagesBytes(descriptionMessages)
+		}
 		dataMessages, updatedResultBytes, err := queryHandler.rowsToDataMessages(rows, originalQueryStatements[i], resultBytes)
 		if err != nil {
 			return nil, err
@@ -352,16 +354,18 @@ func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]p
 }
 
 func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
-	if message.PreparedStatement != preparedStatement.Name {
-		return nil, nil, fmt.Errorf("prepared statement mismatch, %s instead of %s: %s", message.PreparedStatement, preparedStatement.Name, preparedStatement.OriginalQuery)
-	}
-
 	// Bind creates a new portal: results from a previous Bind/Describe of this
-	// statement must not leak into it. Without this reset, a follow-up Execute
-	// reuses the old (possibly consumed) rows via the Rows != nil branch.
+	// statement must not leak into it (a follow-up Execute would reuse them via
+	// the Rows != nil branch). This must run before every error return: on error
+	// the caller nils the statement, orphaning still-open rows beyond the reach
+	// of Sync's cleanup.
 	if preparedStatement.Rows != nil {
 		preparedStatement.Rows.Close()
 		preparedStatement.Rows = nil
+	}
+
+	if message.PreparedStatement != preparedStatement.Name {
+		return nil, nil, fmt.Errorf("prepared statement mismatch, %s instead of %s: %s", message.PreparedStatement, preparedStatement.Name, preparedStatement.OriginalQuery)
 	}
 
 	var variables []interface{}
@@ -441,6 +445,15 @@ func castTextParam(text string, parameterOIDs []uint32, index int) (interface{},
 }
 
 func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
+	// A repeat Describe would otherwise leak the prior result handle until GC
+	// (mirrors the reset in HandleBindQuery). Like there, this must run before
+	// every error return: on error the caller nils the statement, orphaning
+	// still-open rows beyond the reach of Sync's cleanup.
+	if preparedStatement.Rows != nil {
+		preparedStatement.Rows.Close()
+		preparedStatement.Rows = nil
+	}
+
 	switch message.ObjectType {
 	case 'S': // Statement
 		if message.Name != preparedStatement.Name {
@@ -455,13 +468,6 @@ func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe
 	preparedStatement.Described = true
 	if preparedStatement.Query == "" || !preparedStatement.Bound { // Empty query or Parse->[No Bind]->Describe
 		return []pgproto3.Message{&pgproto3.NoData{}}, preparedStatement, nil
-	}
-
-	// A repeat Describe of the same portal would otherwise leak the prior result
-	// handle until GC (mirrors the reset in HandleBindQuery).
-	if preparedStatement.Rows != nil {
-		preparedStatement.Rows.Close()
-		preparedStatement.Rows = nil
 	}
 
 	rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
