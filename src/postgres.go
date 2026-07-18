@@ -167,9 +167,11 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			postgres.writeMessages(&pgproto3.CloseComplete{})
 		case *pgproto3.Sync:
 			LogDebug(postgres.config, "Syncing query")
-			// Release rows left open by a suspended portal (Execute.MaxRows) or a
-			// Describe that was never followed by Execute. Close is idempotent.
-			if preparedStatement.Rows != nil {
+			// Sync must always respond, so unlike the guarded cases above it runs
+			// even after an error — when a Bind/Describe failure has left
+			// preparedStatement nil. Guard the pointer, then release rows left open
+			// by a Describe that was never followed by Execute (Close is idempotent).
+			if preparedStatement != nil && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
 			}
 			postgres.writeMessages(

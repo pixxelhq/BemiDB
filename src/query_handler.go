@@ -304,6 +304,9 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 			return nil, err
 		}
 		queryMessages = append(queryMessages, descriptionMessages...)
+		// Description messages accumulate into the same single-flush buffer as data
+		// rows, so they count against the shared budget too.
+		resultBytes += encodedMessagesBytes(descriptionMessages)
 		dataMessages, updatedResultBytes, err := queryHandler.rowsToDataMessages(rows, originalQueryStatements[i], resultBytes)
 		if err != nil {
 			return nil, err
@@ -454,6 +457,13 @@ func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe
 		return []pgproto3.Message{&pgproto3.NoData{}}, preparedStatement, nil
 	}
 
+	// A repeat Describe of the same portal would otherwise leak the prior result
+	// handle until GC (mirrors the reset in HandleBindQuery).
+	if preparedStatement.Rows != nil {
+		preparedStatement.Rows.Close()
+		preparedStatement.Rows = nil
+	}
+
 	rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("couldn't execute statement: %w. Original query: %s", err, preparedStatement.OriginalQuery)
@@ -527,6 +537,21 @@ func (queryHandler *QueryHandler) rowsToDescriptionMessages(rows *sql.Rows, orig
 	return messages, nil
 }
 
+// encodedMessagesBytes returns the wire size of already-built messages, used to
+// count RowDescriptions against the result budget. Called only for the few, small
+// description messages per statement — not for data rows, which are measured
+// inline in rowsToDataMessages.
+func encodedMessagesBytes(messages []pgproto3.Message) int64 {
+	var total int64
+	for _, message := range messages {
+		buf, err := message.Encode(nil)
+		if err == nil {
+			total += int64(len(buf))
+		}
+	}
+	return total
+}
+
 // Estimated heap cost per buffered row beyond raw cell bytes: the DataRow struct,
 // its [][]byte backing array (NULL cells included), one allocation per non-NULL
 // cell, and the messages slice entry. Deliberate overestimates so the cap errs on
@@ -549,6 +574,13 @@ func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQue
 
 	maxResultBytes := int64(queryHandler.config.MaxResultMb) * 1024 * 1024
 	resultBytes := startResultBytes
+
+	// Catch a result already over budget from prior statements' rows or from wide
+	// RowDescriptions, even when this statement yields no rows (the per-row check
+	// below would never run).
+	if maxResultBytes > 0 && resultBytes > maxResultBytes {
+		return nil, resultBytes, fmt.Errorf("result exceeded the %d MB limit (BEMIDB_MAX_RESULT_MB); add a LIMIT or select fewer columns. Original query: %s", queryHandler.config.MaxResultMb, originalQuery)
+	}
 
 	var messages []pgproto3.Message
 	for rows.Next() {
