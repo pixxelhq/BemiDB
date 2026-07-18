@@ -1733,18 +1733,20 @@ func testResponseByQuery(t *testing.T, queryHandler *QueryHandler, responseByQue
 	}
 }
 
-func TestHandleExecuteQueryWithMaxRows(t *testing.T) {
+func TestHandleExecuteQueryIgnoresMaxRows(t *testing.T) {
 	createTestTables(t)
 	queryHandler := initQueryHandler()
 	defer queryHandler.duckdb.Close()
 
-	t.Run("Suspends the portal at Execute.MaxRows and resumes until completion", func(t *testing.T) {
+	t.Run("Returns the full result and CommandComplete even when Execute.MaxRows is set", func(t *testing.T) {
+		// Honoring MaxRows requires portal suspension that survives Sync, which the
+		// connection loop does not support. This pins the deliberate behavior:
+		// ignore the row cap, never emit PortalSuspended (a resume invitation the
+		// server cannot honor), and rely on --max-result-mb for memory safety.
 		parseMessage := &pgproto3.Parse{Query: "SELECT i FROM (VALUES (1), (2), (3), (4), (5)) AS t(i)"}
 		_, preparedStatement, err := queryHandler.HandleParseQuery(parseMessage)
 		testNoError(t, err)
 		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
-		testNoError(t, err)
-		_, preparedStatement, err = queryHandler.HandleDescribeQuery(&pgproto3.Describe{ObjectType: 'P'}, preparedStatement)
 		testNoError(t, err)
 
 		messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{MaxRows: 2}, preparedStatement)
@@ -1752,46 +1754,65 @@ func TestHandleExecuteQueryWithMaxRows(t *testing.T) {
 		testMessageTypes(t, messages, []pgproto3.Message{
 			&pgproto3.DataRow{},
 			&pgproto3.DataRow{},
-			&pgproto3.PortalSuspended{},
-		})
-		if preparedStatement.Rows == nil {
-			t.Errorf("Expected the suspended portal to keep its rows open")
-		}
-
-		messages, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{MaxRows: 2}, preparedStatement)
-		testNoError(t, err)
-		testMessageTypes(t, messages, []pgproto3.Message{
 			&pgproto3.DataRow{},
 			&pgproto3.DataRow{},
-			&pgproto3.PortalSuspended{},
-		})
-
-		messages, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{MaxRows: 2}, preparedStatement)
-		testNoError(t, err)
-		testMessageTypes(t, messages, []pgproto3.Message{
 			&pgproto3.DataRow{},
 			&pgproto3.CommandComplete{},
 		})
-		if string(messages[0].(*pgproto3.DataRow).Values[0]) != "5" {
-			t.Errorf("Expected the last row to be 5, got %s", string(messages[0].(*pgproto3.DataRow).Values[0]))
-		}
 	})
+}
 
-	t.Run("Returns all rows and CommandComplete when MaxRows is 0", func(t *testing.T) {
-		parseMessage := &pgproto3.Parse{Query: "SELECT i FROM (VALUES (1), (2), (3)) AS t(i)"}
+func TestHandleBindQueryResetsRows(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+
+	t.Run("Re-binding a statement produces fresh results instead of reusing consumed rows", func(t *testing.T) {
+		parseMessage := &pgproto3.Parse{Query: "SELECT i FROM (VALUES (1), (2)) AS t(i)"}
 		_, preparedStatement, err := queryHandler.HandleParseQuery(parseMessage)
 		testNoError(t, err)
 		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
 		testNoError(t, err)
-
 		messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
 		testNoError(t, err)
 		testMessageTypes(t, messages, []pgproto3.Message{
 			&pgproto3.DataRow{},
 			&pgproto3.DataRow{},
+			&pgproto3.CommandComplete{},
+		})
+
+		// Second Bind on the same statement: must not resume the consumed rows.
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
+		testNoError(t, err)
+		messages, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+		testNoError(t, err)
+		testMessageTypes(t, messages, []pgproto3.Message{
+			&pgproto3.DataRow{},
 			&pgproto3.DataRow{},
 			&pgproto3.CommandComplete{},
 		})
+	})
+}
+
+func TestHandleSimpleQueryWithMaxResultMb(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+
+	originalMaxResultMb := queryHandler.config.MaxResultMb
+	queryHandler.config.MaxResultMb = 1
+	defer func() { queryHandler.config.MaxResultMb = originalMaxResultMb }()
+
+	t.Run("Applies one shared budget across the statements of a multi-statement query", func(t *testing.T) {
+		// Each statement is ~0.7MB (under the 1MB cap alone); together they exceed
+		// it. All statements accumulate into one buffer, so the budget must too.
+		_, err := queryHandler.HandleSimpleQuery("SELECT repeat('x', 700000); SELECT repeat('y', 700000)")
+		if err == nil {
+			t.Fatalf("Expected an error for combined statement results exceeding the byte cap")
+		}
+		if !strings.Contains(err.Error(), "result exceeded the 1 MB limit") {
+			t.Errorf("Expected a result-size error, got: %v", err)
+		}
 	})
 }
 

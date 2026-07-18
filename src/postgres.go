@@ -156,6 +156,10 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			}
 			postgres.writeMessages(messages...)
 		case *pgproto3.Close:
+			if previousErr != nil { // Skip processing the next message if there was an error in the previous message
+				continue
+			}
+
 			LogDebug(postgres.config, "Closing", string(message.ObjectType), message.Name)
 			if preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()

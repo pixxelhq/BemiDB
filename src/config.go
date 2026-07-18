@@ -161,6 +161,12 @@ func registerFlags() {
 func parseFlags() {
 	flag.Parse()
 
+	// Fail fast: a negative value would silently disable the cap while the
+	// operator believes they are protected.
+	if _config.MaxResultMb < 0 {
+		panic("--max-result-mb (BEMIDB_MAX_RESULT_MB) must be >= 0, got " + IntToString(_config.MaxResultMb))
+	}
+
 	if _config.Host == "" {
 		_config.Host = DEFAULT_HOST
 	}
