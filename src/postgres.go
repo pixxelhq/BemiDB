@@ -155,8 +155,19 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 				previousErr = err
 			}
 			postgres.writeMessages(messages...)
+		case *pgproto3.Close:
+			LogDebug(postgres.config, "Closing", string(message.ObjectType), message.Name)
+			if preparedStatement.Rows != nil {
+				preparedStatement.Rows.Close()
+			}
+			postgres.writeMessages(&pgproto3.CloseComplete{})
 		case *pgproto3.Sync:
 			LogDebug(postgres.config, "Syncing query")
+			// Release rows left open by a suspended portal (Execute.MaxRows) or a
+			// Describe that was never followed by Execute. Close is idempotent.
+			if preparedStatement.Rows != nil {
+				preparedStatement.Rows.Close()
+			}
 			postgres.writeMessages(
 				&pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE},
 			)

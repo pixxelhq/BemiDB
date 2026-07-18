@@ -1732,3 +1732,108 @@ func testResponseByQuery(t *testing.T, queryHandler *QueryHandler, responseByQue
 		})
 	}
 }
+
+func TestHandleExecuteQueryWithMaxRows(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+
+	t.Run("Suspends the portal at Execute.MaxRows and resumes until completion", func(t *testing.T) {
+		parseMessage := &pgproto3.Parse{Query: "SELECT i FROM (VALUES (1), (2), (3), (4), (5)) AS t(i)"}
+		_, preparedStatement, err := queryHandler.HandleParseQuery(parseMessage)
+		testNoError(t, err)
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
+		testNoError(t, err)
+		_, preparedStatement, err = queryHandler.HandleDescribeQuery(&pgproto3.Describe{ObjectType: 'P'}, preparedStatement)
+		testNoError(t, err)
+
+		messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{MaxRows: 2}, preparedStatement)
+		testNoError(t, err)
+		testMessageTypes(t, messages, []pgproto3.Message{
+			&pgproto3.DataRow{},
+			&pgproto3.DataRow{},
+			&pgproto3.PortalSuspended{},
+		})
+		if preparedStatement.Rows == nil {
+			t.Errorf("Expected the suspended portal to keep its rows open")
+		}
+
+		messages, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{MaxRows: 2}, preparedStatement)
+		testNoError(t, err)
+		testMessageTypes(t, messages, []pgproto3.Message{
+			&pgproto3.DataRow{},
+			&pgproto3.DataRow{},
+			&pgproto3.PortalSuspended{},
+		})
+
+		messages, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{MaxRows: 2}, preparedStatement)
+		testNoError(t, err)
+		testMessageTypes(t, messages, []pgproto3.Message{
+			&pgproto3.DataRow{},
+			&pgproto3.CommandComplete{},
+		})
+		if string(messages[0].(*pgproto3.DataRow).Values[0]) != "5" {
+			t.Errorf("Expected the last row to be 5, got %s", string(messages[0].(*pgproto3.DataRow).Values[0]))
+		}
+	})
+
+	t.Run("Returns all rows and CommandComplete when MaxRows is 0", func(t *testing.T) {
+		parseMessage := &pgproto3.Parse{Query: "SELECT i FROM (VALUES (1), (2), (3)) AS t(i)"}
+		_, preparedStatement, err := queryHandler.HandleParseQuery(parseMessage)
+		testNoError(t, err)
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
+		testNoError(t, err)
+
+		messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+		testNoError(t, err)
+		testMessageTypes(t, messages, []pgproto3.Message{
+			&pgproto3.DataRow{},
+			&pgproto3.DataRow{},
+			&pgproto3.DataRow{},
+			&pgproto3.CommandComplete{},
+		})
+	})
+}
+
+func TestHandleExecuteQueryWithMaxResultMb(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+
+	originalMaxResultMb := queryHandler.config.MaxResultMb
+	queryHandler.config.MaxResultMb = 1
+	defer func() { queryHandler.config.MaxResultMb = originalMaxResultMb }()
+
+	t.Run("Fails a query whose result exceeds the byte cap", func(t *testing.T) {
+		parseMessage := &pgproto3.Parse{Query: "SELECT repeat('x', 500000) AS v FROM (VALUES (1), (2), (3)) AS t(i)"}
+		_, preparedStatement, err := queryHandler.HandleParseQuery(parseMessage)
+		testNoError(t, err)
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
+		testNoError(t, err)
+
+		_, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+		if err == nil {
+			t.Fatalf("Expected an error for a result exceeding the byte cap")
+		}
+		if !strings.Contains(err.Error(), "result exceeded the 1 MB limit") {
+			t.Errorf("Expected a result-size error, got: %v", err)
+		}
+	})
+
+	t.Run("Allows a query whose result stays under the byte cap", func(t *testing.T) {
+		parseMessage := &pgproto3.Parse{Query: "SELECT repeat('x', 1000) AS v FROM (VALUES (1), (2), (3)) AS t(i)"}
+		_, preparedStatement, err := queryHandler.HandleParseQuery(parseMessage)
+		testNoError(t, err)
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
+		testNoError(t, err)
+
+		messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+		testNoError(t, err)
+		testMessageTypes(t, messages, []pgproto3.Message{
+			&pgproto3.DataRow{},
+			&pgproto3.DataRow{},
+			&pgproto3.DataRow{},
+			&pgproto3.CommandComplete{},
+		})
+	})
+}

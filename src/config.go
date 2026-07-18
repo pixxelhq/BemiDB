@@ -47,6 +47,7 @@ const (
 	ENV_DUCKDB_MEMORY_LIMIT   = "BEMIDB_DUCKDB_MEMORY_LIMIT"
 	ENV_DUCKDB_TEMP_DIRECTORY = "BEMIDB_DUCKDB_TEMP_DIRECTORY"
 	ENV_DUCKDB_THREADS        = "BEMIDB_DUCKDB_THREADS"
+	ENV_MAX_RESULT_MB         = "BEMIDB_MAX_RESULT_MB"
 
 	ENV_PARQUET_ROW_GROUP_SIZE_MB    = "BEMIDB_PARQUET_ROW_GROUP_SIZE_MB"
 	ENV_PARQUET_PAYLOAD_THRESHOLD_MB = "BEMIDB_PARQUET_PAYLOAD_THRESHOLD_MB"
@@ -100,6 +101,7 @@ type Config struct {
 	DuckDbMemoryLimit         string
 	DuckDbTempDirectory       string
 	DuckDbThreads             int
+	MaxResultMb               int
 	ParquetRowGroupSizeMb     int
 	ParquetPayloadThresholdMb int
 	LogLevel                  string
@@ -135,6 +137,7 @@ func registerFlags() {
 	flag.StringVar(&_config.DuckDbMemoryLimit, "duckdb-memory-limit", os.Getenv(ENV_DUCKDB_MEMORY_LIMIT), "(Optional) DuckDB memory_limit, e.g. \"4GB\". Bounds DuckDB memory; it spills to the temp directory when exceeded. Set below the container memory limit.")
 	flag.StringVar(&_config.DuckDbTempDirectory, "duckdb-temp-directory", os.Getenv(ENV_DUCKDB_TEMP_DIRECTORY), "(Optional) DuckDB temp_directory for spilling to disk. Defaults to the OS temp dir so a memory limit can spill instead of erroring.")
 	flag.IntVar(&_config.DuckDbThreads, "duckdb-threads", intFromEnv(ENV_DUCKDB_THREADS), "(Optional) DuckDB threads. Caps scan parallelism to bound peak memory. Defaults to DuckDB's own default (all host cores).")
+	flag.IntVar(&_config.MaxResultMb, "max-result-mb", intFromEnv(ENV_MAX_RESULT_MB), "(Optional) Maximum result payload in MB per query. Results are buffered in memory before sending, so unbounded results can OOM the process. 0 disables the cap.")
 	flag.IntVar(&_config.ParquetRowGroupSizeMb, "parquet-row-group-size-mb", intFromEnv(ENV_PARQUET_ROW_GROUP_SIZE_MB), "(Optional) Parquet row group size in MB. Smaller values cap the in-memory write buffer. Default: 128")
 	flag.IntVar(&_config.ParquetPayloadThresholdMb, "parquet-payload-threshold-mb", intFromEnv(ENV_PARQUET_PAYLOAD_THRESHOLD_MB), "(Optional) Uncompressed payload (MB) per Parquet file before rolling to a new file. Default: 2048")
 	flag.StringVar(&_config.StoragePath, "storage-path", os.Getenv(ENV_STORAGE_PATH), "Path to the storage folder. Default: \""+DEFAULT_STORAGE_PATH+"\"")

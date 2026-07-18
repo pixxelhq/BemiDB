@@ -301,7 +301,7 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 			return nil, err
 		}
 		queryMessages = append(queryMessages, descriptionMessages...)
-		dataMessages, err := queryHandler.rowsToDataMessages(rows, originalQueryStatements[i])
+		dataMessages, _, err := queryHandler.rowsToDataMessages(rows, originalQueryStatements[i], 0)
 		if err != nil {
 			return nil, err
 		}
@@ -472,9 +472,21 @@ func (queryHandler *QueryHandler) HandleExecuteQuery(message *pgproto3.Execute, 
 		preparedStatement.Rows = rows
 	}
 
-	defer preparedStatement.Rows.Close()
-
-	return queryHandler.rowsToDataMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
+	messages, suspended, err := queryHandler.rowsToDataMessages(preparedStatement.Rows, preparedStatement.OriginalQuery, message.MaxRows)
+	if suspended {
+		// The portal hit the client-requested row limit (Execute.MaxRows, e.g. JDBC
+		// setMaxRows/setFetchSize) with rows possibly remaining. Keep Rows open: a
+		// follow-up Execute on this portal resumes via the Rows != nil branch above.
+		// Sync and Close clean up if the client never resumes.
+		return messages, nil
+	}
+	// Close but keep the Rows pointer: re-Executing a completed portal must return
+	// zero rows (closed rows iterate as empty), not re-run the query.
+	preparedStatement.Rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	return messages, nil
 }
 
 func (queryHandler *QueryHandler) createSchemas() {
@@ -508,19 +520,45 @@ func (queryHandler *QueryHandler) rowsToDescriptionMessages(rows *sql.Rows, orig
 	return messages, nil
 }
 
-func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQuery string) ([]pgproto3.Message, error) {
+// rowsToDataMessages buffers the whole result in memory before it is written to the
+// connection, so it enforces the two result-size bounds: the client-requested row
+// limit from Execute.MaxRows (0 = unlimited; on hitting it the portal is suspended
+// and the second return value is true), and the byte cap from --max-result-mb
+// (0 = disabled; exceeding it fails the query).
+func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQuery string, maxRows uint32) ([]pgproto3.Message, bool, error) {
 	cols, err := rows.ColumnTypes()
 	if err != nil {
-		return nil, fmt.Errorf("couldn't get column types: %w. Original query: %s", err, originalQuery)
+		return nil, false, fmt.Errorf("couldn't get column types: %w. Original query: %s", err, originalQuery)
 	}
+
+	maxResultBytes := int64(queryHandler.config.MaxResultMb) * 1024 * 1024
+	var resultBytes int64
+	var rowCount uint32
 
 	var messages []pgproto3.Message
 	for rows.Next() {
 		dataRow, err := queryHandler.generateDataRow(rows, cols)
 		if err != nil {
-			return nil, fmt.Errorf("couldn't get data row: %w. Original query: %s", err, originalQuery)
+			return nil, false, fmt.Errorf("couldn't get data row: %w. Original query: %s", err, originalQuery)
 		}
 		messages = append(messages, dataRow)
+
+		if maxResultBytes > 0 {
+			for _, value := range dataRow.Values {
+				resultBytes += int64(len(value))
+			}
+			if resultBytes > maxResultBytes {
+				return nil, false, fmt.Errorf("result exceeded the %d MB limit (BEMIDB_MAX_RESULT_MB); add a LIMIT or select fewer columns. Original query: %s", queryHandler.config.MaxResultMb, originalQuery)
+			}
+		}
+
+		if maxRows > 0 {
+			rowCount++
+			if rowCount == maxRows {
+				messages = append(messages, &pgproto3.PortalSuspended{})
+				return messages, true, nil
+			}
+		}
 	}
 
 	commandTag := FALLBACK_SQL_QUERY
@@ -537,7 +575,7 @@ func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQue
 	}
 
 	messages = append(messages, &pgproto3.CommandComplete{CommandTag: []byte(commandTag)})
-	return messages, nil
+	return messages, false, nil
 }
 
 func (queryHandler *QueryHandler) generateRowDescription(cols []*sql.ColumnType) *pgproto3.RowDescription {
