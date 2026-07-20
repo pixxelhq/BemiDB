@@ -155,8 +155,25 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 				previousErr = err
 			}
 			postgres.writeMessages(messages...)
+		case *pgproto3.Close:
+			if previousErr != nil { // Skip processing the next message if there was an error in the previous message
+				continue
+			}
+
+			LogDebug(postgres.config, "Closing", string(message.ObjectType), message.Name)
+			if preparedStatement.Rows != nil {
+				preparedStatement.Rows.Close()
+			}
+			postgres.writeMessages(&pgproto3.CloseComplete{})
 		case *pgproto3.Sync:
 			LogDebug(postgres.config, "Syncing query")
+			// Sync must always respond, so unlike the guarded cases above it runs
+			// even after an error — when a Bind/Describe failure has left
+			// preparedStatement nil. Guard the pointer, then release rows left open
+			// by a Describe that was never followed by Execute (Close is idempotent).
+			if preparedStatement != nil && preparedStatement.Rows != nil {
+				preparedStatement.Rows.Close()
+			}
 			postgres.writeMessages(
 				&pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE},
 			)

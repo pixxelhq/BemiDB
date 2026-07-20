@@ -275,6 +275,9 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 	}
 
 	var queriesMessages []pgproto3.Message
+	// One byte budget across ALL statements: they accumulate into a single buffer
+	// below, so a per-statement budget would multiply the cap by the statement count.
+	var resultBytes int64
 
 	for i, queryStatement := range queryStatements {
 		rows, err := queryHandler.duckdb.QueryContext(context.Background(), queryStatement)
@@ -301,10 +304,16 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 			return nil, err
 		}
 		queryMessages = append(queryMessages, descriptionMessages...)
-		dataMessages, err := queryHandler.rowsToDataMessages(rows, originalQueryStatements[i])
+		if queryHandler.config.MaxResultMb > 0 {
+			// Description messages accumulate into the same single-flush buffer as data
+			// rows, so they count against the shared budget too.
+			resultBytes += encodedMessagesBytes(descriptionMessages)
+		}
+		dataMessages, updatedResultBytes, err := queryHandler.rowsToDataMessages(rows, originalQueryStatements[i], resultBytes)
 		if err != nil {
 			return nil, err
 		}
+		resultBytes = updatedResultBytes
 		queryMessages = append(queryMessages, dataMessages...)
 
 		queriesMessages = append(queriesMessages, queryMessages...)
@@ -345,6 +354,16 @@ func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]p
 }
 
 func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
+	// Bind creates a new portal: results from a previous Bind/Describe of this
+	// statement must not leak into it (a follow-up Execute would reuse them via
+	// the Rows != nil branch). This must run before every error return: on error
+	// the caller nils the statement, orphaning still-open rows beyond the reach
+	// of Sync's cleanup.
+	if preparedStatement.Rows != nil {
+		preparedStatement.Rows.Close()
+		preparedStatement.Rows = nil
+	}
+
 	if message.PreparedStatement != preparedStatement.Name {
 		return nil, nil, fmt.Errorf("prepared statement mismatch, %s instead of %s: %s", message.PreparedStatement, preparedStatement.Name, preparedStatement.OriginalQuery)
 	}
@@ -426,6 +445,15 @@ func castTextParam(text string, parameterOIDs []uint32, index int) (interface{},
 }
 
 func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
+	// A repeat Describe would otherwise leak the prior result handle until GC
+	// (mirrors the reset in HandleBindQuery). Like there, this must run before
+	// every error return: on error the caller nils the statement, orphaning
+	// still-open rows beyond the reach of Sync's cleanup.
+	if preparedStatement.Rows != nil {
+		preparedStatement.Rows.Close()
+		preparedStatement.Rows = nil
+	}
+
 	switch message.ObjectType {
 	case 'S': // Statement
 		if message.Name != preparedStatement.Name {
@@ -474,7 +502,14 @@ func (queryHandler *QueryHandler) HandleExecuteQuery(message *pgproto3.Execute, 
 
 	defer preparedStatement.Rows.Close()
 
-	return queryHandler.rowsToDataMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
+	// Execute.MaxRows (sent by e.g. JDBC setMaxRows/setFetchSize) is deliberately
+	// NOT honored: doing it correctly requires portal suspension that survives Sync,
+	// which the one-exchange-per-Parse connection loop cannot support — emitting
+	// PortalSuspended without that support kills cursor-mode clients on their resume.
+	// Clients receive the full result and truncate client-side (pre-existing
+	// behavior); oversized results are bounded server-side by --max-result-mb.
+	messages, _, err := queryHandler.rowsToDataMessages(preparedStatement.Rows, preparedStatement.OriginalQuery, 0)
+	return messages, err
 }
 
 func (queryHandler *QueryHandler) createSchemas() {
@@ -508,19 +543,68 @@ func (queryHandler *QueryHandler) rowsToDescriptionMessages(rows *sql.Rows, orig
 	return messages, nil
 }
 
-func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQuery string) ([]pgproto3.Message, error) {
+// encodedMessagesBytes returns the wire size of already-built messages, used to
+// count RowDescriptions against the result budget. Called only for the few, small
+// description messages per statement — not for data rows, which are measured
+// inline in rowsToDataMessages.
+func encodedMessagesBytes(messages []pgproto3.Message) int64 {
+	var total int64
+	for _, message := range messages {
+		buf, err := message.Encode(nil)
+		if err == nil {
+			total += int64(len(buf))
+		}
+	}
+	return total
+}
+
+// Estimated heap cost per buffered row beyond raw cell bytes: the DataRow struct,
+// its [][]byte backing array (NULL cells included), one allocation per non-NULL
+// cell, and the messages slice entry. Deliberate overestimates so the cap errs on
+// the safe side; the true multiplier for narrow rows is what matters, not the
+// exact constant.
+const resultBytesPerRowOverhead = 64
+const resultBytesPerCellOverhead = 48
+
+// rowsToDataMessages buffers the whole result in memory before it is written to
+// the connection, so it enforces the --max-result-mb byte cap (0 = disabled):
+// this buffer is the process's largest unbounded allocation, and the pod's OOM
+// killer is the only alternative enforcement. startResultBytes threads one shared
+// budget across the statements of a simple-protocol query; the returned int64 is
+// the updated total.
+func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQuery string, startResultBytes int64) ([]pgproto3.Message, int64, error) {
 	cols, err := rows.ColumnTypes()
 	if err != nil {
-		return nil, fmt.Errorf("couldn't get column types: %w. Original query: %s", err, originalQuery)
+		return nil, startResultBytes, fmt.Errorf("couldn't get column types: %w. Original query: %s", err, originalQuery)
+	}
+
+	maxResultBytes := int64(queryHandler.config.MaxResultMb) * 1024 * 1024
+	resultBytes := startResultBytes
+
+	// Catch a result already over budget from prior statements' rows or from wide
+	// RowDescriptions, even when this statement yields no rows (the per-row check
+	// below would never run).
+	if maxResultBytes > 0 && resultBytes > maxResultBytes {
+		return nil, resultBytes, fmt.Errorf("result exceeded the %d MB limit (BEMIDB_MAX_RESULT_MB); add a LIMIT or select fewer columns. Original query: %s", queryHandler.config.MaxResultMb, originalQuery)
 	}
 
 	var messages []pgproto3.Message
 	for rows.Next() {
 		dataRow, err := queryHandler.generateDataRow(rows, cols)
 		if err != nil {
-			return nil, fmt.Errorf("couldn't get data row: %w. Original query: %s", err, originalQuery)
+			return nil, resultBytes, fmt.Errorf("couldn't get data row: %w. Original query: %s", err, originalQuery)
 		}
 		messages = append(messages, dataRow)
+
+		if maxResultBytes > 0 {
+			resultBytes += resultBytesPerRowOverhead + int64(len(dataRow.Values))*resultBytesPerCellOverhead
+			for _, value := range dataRow.Values {
+				resultBytes += int64(len(value))
+			}
+			if resultBytes > maxResultBytes {
+				return nil, resultBytes, fmt.Errorf("result exceeded the %d MB limit (BEMIDB_MAX_RESULT_MB); add a LIMIT or select fewer columns. Original query: %s", queryHandler.config.MaxResultMb, originalQuery)
+			}
+		}
 	}
 
 	commandTag := FALLBACK_SQL_QUERY
@@ -537,7 +621,7 @@ func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQue
 	}
 
 	messages = append(messages, &pgproto3.CommandComplete{CommandTag: []byte(commandTag)})
-	return messages, nil
+	return messages, resultBytes, nil
 }
 
 func (queryHandler *QueryHandler) generateRowDescription(cols []*sql.ColumnType) *pgproto3.RowDescription {

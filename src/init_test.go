@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"testing"
 )
 
 var PUBLIC_SCHEMA_TEST_TABLE_PG_SCHEMA_COLUMNS = []PgSchemaColumn{
@@ -417,7 +418,28 @@ func init() {
 	}
 }
 
+// os.Args is shared by two flag parsers that want different contents: LoadConfig
+// (BemiDB flags only — a -test.* flag makes its ExitOnError FlagSet abort) and the
+// testing framework (-test.* flags — without them every `go test -run` filter is
+// silently discarded, all tests always run, and a panic in the first test aborts
+// the whole binary). loadTestConfig runs from init(), before the testing framework
+// parses, so it scrubs and then restores; TestMain then parses the -test.* flags
+// and scrubs permanently for tests that call LoadConfig directly.
+func TestMain(m *testing.M) {
+	testing.Init()
+	flag.Parse()
+	setTestArgs([]string{})
+	os.Exit(m.Run())
+}
+
 func loadTestConfig() *Config {
+	originalArgs := os.Args
+	originalCommandLine := flag.CommandLine
+	defer func() {
+		os.Args = originalArgs
+		flag.CommandLine = originalCommandLine
+	}()
+
 	setTestArgs([]string{})
 
 	config := LoadConfig(true)
