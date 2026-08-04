@@ -30,8 +30,8 @@ func (parser *ParserAExpr) ConvertedRightAnyToIn(node *pgQuery.Node) *pgQuery.No
 		return node
 	}
 
-	if aExpr.Rexpr.GetAConst() == nil {
-		// NOTE: ... = ANY() on non-constants is not fully supported yet
+	if aExpr.Rexpr.GetAConst() == nil || aExpr.Rexpr.GetAConst().GetSval() == nil {
+		// NOTE: ... = ANY() on non-constants and non-string constants is not fully supported yet
 		return parser.utils.MakeNullNode()
 	}
 

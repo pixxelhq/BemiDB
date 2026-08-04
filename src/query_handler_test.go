@@ -149,6 +149,21 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {Uint32ToString(pgtype.TextOID)},
 				"values":      {"value"},
 			},
+			"SELECT jsonb_extract_path_text(json_column, VARIADIC ARRAY['key']::text[]) AS jsonb_extract_path_text FROM test_table LIMIT 1": {
+				"description": {"jsonb_extract_path_text"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"value"},
+			},
+			"SELECT bemidb_last_synced_at(123) AS last_synced_at": {
+				"description": {"last_synced_at"},
+				"types":       {Uint32ToString(pgtype.TimestamptzOID)},
+				"values":      {""},
+			},
+			"SELECT 1 AS value WHERE 1 = ANY(123)": {
+				"description": {"value"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {},
+			},
 			"SELECT encode(sha256('foo'), 'hex'::text) AS encode": {
 				"description": {"encode"},
 				"types":       {Uint32ToString(pgtype.TextOID)},
@@ -168,6 +183,106 @@ func TestHandleQuery(t *testing.T) {
 				"description": {"pg_relation_is_publishable"},
 				"types":       {Uint32ToString(pgtype.Int4OID)},
 				"values":      {""},
+			},
+		})
+	})
+
+	t.Run("JSON functions", func(t *testing.T) {
+		testResponseByQuery(t, queryHandler, map[string]map[string][]string{
+			"SELECT json_array_elements('[{\"a\":1},{\"a\":2}]') LIMIT 1": {
+				"description": {"json_array_elements"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"{\"a\":1}"},
+			},
+			"SELECT jsonb_array_elements(NULL) AS element": {
+				"description": {"element"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {},
+			},
+			"SELECT COUNT(*) AS count FROM jsonb_array_elements('[1, 2, 3]')": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"3"},
+			},
+			"SELECT value FROM pg_catalog.json_array_elements('[\"x\"]')": {
+				"description": {"value"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"\"x\""},
+			},
+			"SELECT value FROM json_array_elements_text('[\"first\", \"second\"]') LIMIT 1": {
+				"description": {"value"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"first"},
+			},
+			"SELECT key, value FROM json_each('{\"a\": 1, \"b\": \"x\"}') WHERE key = 'b'": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"b", "\"x\""},
+			},
+			"SELECT key, value FROM jsonb_each_text('{\"a\": 1, \"b\": \"x\"}') WHERE key = 'b'": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"b", "x"},
+			},
+			"SELECT key, value FROM jsonb_each('{\"a\": 1, \"b\": \"x\"}') WHERE key = 'b'": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"b", "\"x\""},
+			},
+			"SELECT key, value FROM json_each_text('{\"a\": 1, \"b\": \"x\"}') WHERE key = 'b'": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"b", "x"},
+			},
+			"SELECT json_object_keys FROM json_object_keys('{\"k1\": 1, \"k2\": 2}') WHERE json_object_keys = 'k2'": {
+				"description": {"json_object_keys"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"k2"},
+			},
+			"SELECT jsonb_object_keys FROM jsonb_object_keys('{\"k1\": 1, \"k2\": 2}') WHERE jsonb_object_keys = 'k1'": {
+				"description": {"jsonb_object_keys"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"k1"},
+			},
+			"SELECT json_object_keys(json_column) AS key FROM public.test_table WHERE json_column IS NOT NULL": {
+				"description": {"key"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"key"},
+			},
+			"SELECT '{\"a\": {\"b\": 2}}'::jsonb->'a'->>'b' AS value": {
+				"description": {"value"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"2"},
+			},
+			"SELECT t.id, json_extract_string(c.value, '$.aoi') AS aoi FROM (VALUES (1, '{\"components\": [{\"aoi\": \"area-77\"}]}')) t (id, spec), jsonb_array_elements(t.spec->'components') c": {
+				"description": {"id", "aoi"},
+				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"1", "area-77"},
+			},
+			"SELECT e.key, e.value FROM public.test_table tt, json_each(tt.json_column) e WHERE tt.json_column IS NOT NULL": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"key", "\"value\""},
+			},
+			"SELECT j.job_id, c.value ->> 'type' AS type FROM (VALUES (1, '{\"components\": [{\"type\": \"aoi\"}]}')) j (job_id, spec) CROSS JOIN LATERAL jsonb_array_elements(j.spec::jsonb -> 'components') c": {
+				"description": {"job_id", "type"},
+				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"1", "aoi"},
+			},
+			"SELECT j.job_id, c.value FROM (VALUES (2, '{\"components\": []}')) j (job_id, spec) LEFT JOIN LATERAL jsonb_array_elements(j.spec::jsonb -> 'components') c ON true": {
+				"description": {"job_id", "value"},
+				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"2", ""},
+			},
+			"SELECT t1.id AS id, c.value AS value FROM (VALUES (1)) t1 (id), (VALUES (2)) t2 (y) JOIN jsonb_array_elements('[5]') c ON true": {
+				"description": {"id", "value"},
+				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"1", "5"},
+			},
+			"SELECT COUNT(*) AS count FROM (VALUES (1)) v (x), public.test_table t1 JOIN public.test_table t2 ON t2.id = t1.id": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"2"},
 			},
 		})
 	})
@@ -1657,7 +1772,9 @@ func testNoError(t *testing.T, err error) {
 
 func testMessageTypes(t *testing.T, messages []pgproto3.Message, expectedTypes []pgproto3.Message) {
 	if len(messages) != len(expectedTypes) {
-		t.Errorf("Expected %v messages, got %v", len(expectedTypes), len(messages))
+		// Fatal instead of panicking with index out of range below (which aborts the whole test suite).
+		// This also protects callers that index into messages[N] right after this check.
+		t.Fatalf("Expected %v messages, got %v", len(expectedTypes), len(messages))
 	}
 
 	for i, expectedType := range expectedTypes {
@@ -1668,10 +1785,15 @@ func testMessageTypes(t *testing.T, messages []pgproto3.Message, expectedTypes [
 }
 
 func testRowDescription(t *testing.T, rowDescriptionMessage pgproto3.Message, expectedColumnNames []string, expectedColumnTypes []string) {
-	rowDescription := rowDescriptionMessage.(*pgproto3.RowDescription)
+	rowDescription, ok := rowDescriptionMessage.(*pgproto3.RowDescription)
+	if !ok {
+		t.Errorf("Expected a RowDescription message, got %T", rowDescriptionMessage)
+		return
+	}
 
 	if len(rowDescription.Fields) != len(expectedColumnNames) {
 		t.Errorf("Expected %v row description fields, got %v", len(expectedColumnNames), len(rowDescription.Fields))
+		return // Fail instead of panicking with index out of range below (which aborts the whole test suite)
 	}
 
 	for i, expectedColumnName := range expectedColumnNames {
@@ -1688,10 +1810,15 @@ func testRowDescription(t *testing.T, rowDescriptionMessage pgproto3.Message, ex
 }
 
 func testDataRowValues(t *testing.T, dataRowMessage pgproto3.Message, expectedValues []string) {
-	dataRow := dataRowMessage.(*pgproto3.DataRow)
+	dataRow, ok := dataRowMessage.(*pgproto3.DataRow)
+	if !ok {
+		t.Errorf("Expected a DataRow message, got %T", dataRowMessage)
+		return
+	}
 
 	if len(dataRow.Values) != len(expectedValues) {
 		t.Errorf("Expected %v data row values, got %v", len(expectedValues), len(dataRow.Values))
+		return // Fail instead of panicking with index out of range below (which aborts the whole test suite)
 	}
 
 	for i, expectedValue := range expectedValues {
@@ -1714,6 +1841,9 @@ func testResponseByQuery(t *testing.T, queryHandler *QueryHandler, responseByQue
 			messages, err := queryHandler.HandleSimpleQuery(query)
 
 			testNoError(t, err)
+			if len(messages) == 0 {
+				return // The error above already failed the test; avoid panicking on messages[0] (which aborts the whole test suite)
+			}
 			testRowDescription(t, messages[0], responses["description"], responses["types"])
 
 			if len(responses["values"]) > 0 {

@@ -62,8 +62,15 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 		"CREATE MACRO every(x) AS bool_and(x)",
 		"CREATE MACRO json_typeof(j) AS json_type(j)",
 		"CREATE MACRO jsonb_typeof(j) AS json_type(j)",
-		"CREATE MACRO json_object_keys(j) AS json_keys(j)",
-		"CREATE MACRO jsonb_object_keys(j) AS json_keys(j)",
+		// JSON set-returning functions used in the SELECT list: SELECT json_array_elements(...) FROM ...
+		// js::JSON makes element splitting JSON-aware (DuckDB's plain VARCHAR -> list cast is not)
+		"CREATE MACRO json_array_elements(js) AS unnest(CAST(js::JSON AS JSON[]))",
+		"CREATE MACRO jsonb_array_elements(js) AS unnest(CAST(js::JSON AS JSON[]))",
+		"CREATE MACRO json_array_elements_text(js) AS unnest(CAST(js::JSON AS VARCHAR[]))",
+		"CREATE MACRO jsonb_array_elements_text(js) AS unnest(CAST(js::JSON AS VARCHAR[]))",
+		// One row per key to match Postgres SETOF semantics (previously returned the whole key array in one row)
+		"CREATE MACRO json_object_keys(j) AS unnest(json_keys(j))",
+		"CREATE MACRO jsonb_object_keys(j) AS unnest(json_keys(j))",
 		"CREATE MACRO json_agg(x) AS json_group_array(x)",
 		"CREATE MACRO jsonb_agg(x) AS json_group_array(x)",
 		"CREATE MACRO json_object_agg(k, v) AS json_group_object(k, v)",
@@ -110,6 +117,20 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 			keyword_category AS catdesc,
 			'can be bare label' AS baredesc
 		FROM duckdb_keywords()`,
+
+		// JSON set-returning functions used in the FROM clause (incl. laterally): FROM table, json_each(table.column)
+		// Same names as the scalar macros above: DuckDB stores scalar and table macros in separate catalog namespaces
+		"CREATE MACRO json_array_elements(js) AS TABLE SELECT unnest(CAST(js::JSON AS JSON[])) AS value",
+		"CREATE MACRO jsonb_array_elements(js) AS TABLE SELECT unnest(CAST(js::JSON AS JSON[])) AS value",
+		"CREATE MACRO json_array_elements_text(js) AS TABLE SELECT unnest(CAST(js::JSON AS VARCHAR[])) AS value",
+		"CREATE MACRO jsonb_array_elements_text(js) AS TABLE SELECT unnest(CAST(js::JSON AS VARCHAR[])) AS value",
+		"CREATE MACRO json_object_keys(js) AS TABLE SELECT unnest(json_keys(js)) AS json_object_keys",
+		"CREATE MACRO jsonb_object_keys(js) AS TABLE SELECT unnest(json_keys(js)) AS jsonb_object_keys",
+		// unnest(..., recursive := true) flattens the map entry STRUCT(key, value) into (key, value) columns
+		"CREATE MACRO json_each(js) AS TABLE SELECT unnest(map_entries(CAST(js::JSON AS MAP(VARCHAR, JSON))), recursive := true)",
+		"CREATE MACRO jsonb_each(js) AS TABLE SELECT unnest(map_entries(CAST(js::JSON AS MAP(VARCHAR, JSON))), recursive := true)",
+		"CREATE MACRO json_each_text(js) AS TABLE SELECT unnest(map_entries(CAST(js::JSON AS MAP(VARCHAR, VARCHAR))), recursive := true)",
+		"CREATE MACRO jsonb_each_text(js) AS TABLE SELECT unnest(map_entries(CAST(js::JSON AS MAP(VARCHAR, VARCHAR))), recursive := true)",
 	}
 	PG_CATALOG_MACRO_FUNCTION_NAMES = extractMacroNames(result)
 	return result

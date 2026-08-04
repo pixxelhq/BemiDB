@@ -65,7 +65,8 @@ func (parser *ParserTypeCast) RemovedDefaultCollateClause(node *pgQuery.Node) *p
 }
 
 func (parser *ParserTypeCast) ArgStringValue(typeCast *pgQuery.TypeCast) string {
-	return typeCast.Arg.GetAConst().GetSval().Sval
+	// Nil-safe getter chain: returns "" for non-constant and non-string-constant arguments
+	return typeCast.Arg.GetAConst().GetSval().GetSval()
 }
 
 // pg_catalog.[type] -> [type]
@@ -83,7 +84,12 @@ func (parser *ParserTypeCast) SetTypeName(typeCast *pgQuery.TypeCast, name strin
 	typeCast.TypeName.Names = []*pgQuery.Node{pgQuery.MakeStrNode(name)}
 }
 
+// Returns nil if the argument is not a string constant (e.g. a column reference or 123::text[])
 func (parser *ParserTypeCast) MakeListValueFromArray(node *pgQuery.Node) *pgQuery.Node {
+	if node.GetAConst() == nil || node.GetAConst().GetSval() == nil {
+		return nil
+	}
+
 	arrayStr := node.GetAConst().GetSval().Sval
 	arrayStr = strings.Trim(arrayStr, "{}")
 	elements := strings.Split(arrayStr, ",")
@@ -140,8 +146,8 @@ func (parser *ParserTypeCast) MakeSubselectOidBySchemaTableArg(argumentNode *pgQ
 		),
 	)
 
-	if argumentNode.GetAConst() == nil {
-		// NOTE: ::regclass::oid on non-constants is not fully supported yet
+	if argumentNode.GetAConst() == nil || argumentNode.GetAConst().GetSval() == nil {
+		// NOTE: ::regclass::oid on non-constants and non-string constants (e.g. 1::regclass) is not fully supported yet
 		return parser.utils.MakeNullNode()
 	}
 

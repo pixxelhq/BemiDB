@@ -184,6 +184,10 @@ func (remapper *QueryRemapperTable) RemapTable(node *pgQuery.Node) *pgQuery.Node
 	})
 }
 
+func (remapper *QueryRemapperTable) TableFunctionCalls(rangeFunction *pgQuery.RangeFunction) []*pgQuery.FuncCall {
+	return remapper.parserTable.TableFunctionCalls(rangeFunction)
+}
+
 // FROM FUNCTION()
 func (remapper *QueryRemapperTable) RemapTableFunctionCall(rangeFunction *pgQuery.RangeFunction) {
 	schemaFunction := remapper.parserTable.TopLevelSchemaFunction(rangeFunction)

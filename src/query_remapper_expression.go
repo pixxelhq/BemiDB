@@ -49,10 +49,17 @@ func (remapper *QueryRemapperExpression) remappedTypeCast(node *pgQuery.Node) *p
 		return node
 	case "text[]":
 		// '{a,b,c}'::text[] -> ARRAY['a', 'b', 'c']
-		return remapper.parserTypeCast.MakeListValueFromArray(typeCast.Arg)
+		if listNode := remapper.parserTypeCast.MakeListValueFromArray(typeCast.Arg); listNode != nil {
+			return listNode
+		}
+		return node
 	case "regproc":
 		// 'schema.function_name'::regproc -> 'function_name'
-		nameParts := strings.Split(remapper.parserTypeCast.ArgStringValue(typeCast), ".")
+		value := remapper.parserTypeCast.ArgStringValue(typeCast)
+		if value == "" {
+			return node
+		}
+		nameParts := strings.Split(value, ".")
 		return pgQuery.MakeAConstStrNode(nameParts[len(nameParts)-1], 0)
 	case "regclass":
 		// 'schema.table'::regclass -> SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'schema' AND c.relname = 'table'

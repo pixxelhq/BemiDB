@@ -23,7 +23,8 @@ func (parser *ParserFunction) FirstArgumentToString(functionCall *pgQuery.FuncCa
 	if len(functionCall.Args) < 1 {
 		return ""
 	}
-	return functionCall.Args[0].GetAConst().GetSval().Sval
+	// Nil-safe getter chain: returns "" for non-constant and non-string-constant arguments
+	return functionCall.Args[0].GetAConst().GetSval().GetSval()
 }
 
 // n from (FUNCTION()).n
@@ -130,11 +131,12 @@ func (parser *ParserFunction) RemapToFunction(functionCall *pgQuery.FuncCall, na
 }
 
 func (parser *ParserFunction) constStringValue(node *pgQuery.Node) string {
+	// Nil-safe getter chains: return "" for non-string constants (e.g. integers) instead of panicking
 	if node.GetAConst() != nil {
-		return node.GetAConst().GetSval().Sval
+		return node.GetAConst().GetSval().GetSval()
 	}
 	if typeCast := node.GetTypeCast(); typeCast != nil && typeCast.Arg.GetAConst() != nil {
-		return typeCast.Arg.GetAConst().GetSval().Sval
+		return typeCast.Arg.GetAConst().GetSval().GetSval()
 	}
 	return ""
 }
@@ -281,14 +283,26 @@ func (parser *ParserFunction) RemapToTimestampFormat(functionCall *pgQuery.FuncC
 
 // jsonb_extract_path_text(json, 'a', 'b', 'c')
 //   -> json_extract_string(json, '$.a.b.c')
-// Converts variadic path elements into a JSONPath string.
+// Converts path elements (plain args or a VARIADIC ARRAY[...] arg) into a JSONPath string.
 func (parser *ParserFunction) RemapJsonbExtractPathText(functionCall *pgQuery.FuncCall) {
 	if len(functionCall.Args) < 2 {
 		return
 	}
 
+	pathArgs := functionCall.Args[1:]
+	// jsonb_extract_path_text(json, VARIADIC ARRAY['a', 'b']) with an optional ::text[] cast around the ARRAY
+	if functionCall.FuncVariadic {
+		arrayNode := functionCall.Args[1]
+		if typeCast := arrayNode.GetTypeCast(); typeCast != nil {
+			arrayNode = typeCast.Arg
+		}
+		if arrayExpr := arrayNode.GetAArrayExpr(); arrayExpr != nil {
+			pathArgs = arrayExpr.Elements
+		}
+	}
+
 	pathParts := []string{"$"}
-	for _, arg := range functionCall.Args[1:] {
+	for _, arg := range pathArgs {
 		part := parser.constStringValue(arg)
 		if part == "" {
 			return
@@ -298,6 +312,7 @@ func (parser *ParserFunction) RemapJsonbExtractPathText(functionCall *pgQuery.Fu
 	jsonPath := strings.Join(pathParts, ".")
 
 	functionCall.Funcname = []*pgQuery.Node{pgQuery.MakeStrNode("json_extract_string")}
+	functionCall.FuncVariadic = false
 	functionCall.Args = []*pgQuery.Node{
 		functionCall.Args[0],
 		pgQuery.MakeAConstStrNode(jsonPath, 0),
