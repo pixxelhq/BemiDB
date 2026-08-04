@@ -204,8 +204,8 @@ func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.Sel
 			} else if fromNode.GetRangeFunction() != nil {
 				// FROM PG_FUNCTION()
 				remapper.traceTreeTraversal("FROM function()", indentLevel)
-				remapper.remapperTable.RemapTableFunctionCall(fromNode.GetRangeFunction())  // recursion
-				remapper.remapTableFunctionArgs(fromNode.GetRangeFunction(), indentLevel+1) // recursion
+				remapper.remapperTable.RemapTableFunctionCall(fromNode.GetRangeFunction()) // recursion
+				remapper.remapTableFunctionArgs(fromNode.GetRangeFunction(), indentLevel+1)
 			}
 		}
 	}

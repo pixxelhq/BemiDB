@@ -258,9 +258,7 @@ func (parser *ParserFunction) RemapToDate(functionCall *pgQuery.FuncCall) {
 }
 
 // to_timestamp('2024-01-15 10:30', 'YYYY-MM-DD HH24:MI')
-//
-//	-> strptime('2024-01-15 10:30', '%Y-%m-%d %H:%M')
-//
+//   -> strptime('2024-01-15 10:30', '%Y-%m-%d %H:%M')
 // Note: PG's to_timestamp(epoch_seconds) is a 1-arg form that DuckDB already
 // supports natively, so we only remap the 2-arg form here.
 func (parser *ParserFunction) RemapToTimestampFormat(functionCall *pgQuery.FuncCall) {
@@ -282,9 +280,7 @@ func (parser *ParserFunction) RemapToTimestampFormat(functionCall *pgQuery.FuncC
 }
 
 // jsonb_extract_path_text(json, 'a', 'b', 'c')
-//
-//	-> json_extract_string(json, '$.a.b.c')
-//
+//   -> json_extract_string(json, '$.a.b.c')
 // Converts path elements (plain args or a VARIADIC ARRAY[...] arg) into a JSONPath string.
 func (parser *ParserFunction) RemapJsonbExtractPathText(functionCall *pgQuery.FuncCall) {
 	if len(functionCall.Args) < 2 {
