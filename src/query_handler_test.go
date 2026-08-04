@@ -1658,6 +1658,7 @@ func testNoError(t *testing.T, err error) {
 func testMessageTypes(t *testing.T, messages []pgproto3.Message, expectedTypes []pgproto3.Message) {
 	if len(messages) != len(expectedTypes) {
 		t.Errorf("Expected %v messages, got %v", len(expectedTypes), len(messages))
+		return // Fail instead of panicking with index out of range below (which aborts the whole test suite)
 	}
 
 	for i, expectedType := range expectedTypes {
@@ -1668,10 +1669,15 @@ func testMessageTypes(t *testing.T, messages []pgproto3.Message, expectedTypes [
 }
 
 func testRowDescription(t *testing.T, rowDescriptionMessage pgproto3.Message, expectedColumnNames []string, expectedColumnTypes []string) {
-	rowDescription := rowDescriptionMessage.(*pgproto3.RowDescription)
+	rowDescription, ok := rowDescriptionMessage.(*pgproto3.RowDescription)
+	if !ok {
+		t.Errorf("Expected a RowDescription message, got %T", rowDescriptionMessage)
+		return
+	}
 
 	if len(rowDescription.Fields) != len(expectedColumnNames) {
 		t.Errorf("Expected %v row description fields, got %v", len(expectedColumnNames), len(rowDescription.Fields))
+		return // Fail instead of panicking with index out of range below (which aborts the whole test suite)
 	}
 
 	for i, expectedColumnName := range expectedColumnNames {
@@ -1688,10 +1694,15 @@ func testRowDescription(t *testing.T, rowDescriptionMessage pgproto3.Message, ex
 }
 
 func testDataRowValues(t *testing.T, dataRowMessage pgproto3.Message, expectedValues []string) {
-	dataRow := dataRowMessage.(*pgproto3.DataRow)
+	dataRow, ok := dataRowMessage.(*pgproto3.DataRow)
+	if !ok {
+		t.Errorf("Expected a DataRow message, got %T", dataRowMessage)
+		return
+	}
 
 	if len(dataRow.Values) != len(expectedValues) {
 		t.Errorf("Expected %v data row values, got %v", len(expectedValues), len(dataRow.Values))
+		return // Fail instead of panicking with index out of range below (which aborts the whole test suite)
 	}
 
 	for i, expectedValue := range expectedValues {
@@ -1714,6 +1725,9 @@ func testResponseByQuery(t *testing.T, queryHandler *QueryHandler, responseByQue
 			messages, err := queryHandler.HandleSimpleQuery(query)
 
 			testNoError(t, err)
+			if len(messages) == 0 {
+				return // The error above already failed the test; avoid panicking on messages[0] (which aborts the whole test suite)
+			}
 			testRowDescription(t, messages[0], responses["description"], responses["types"])
 
 			if len(responses["values"]) > 0 {
@@ -1722,7 +1736,9 @@ func testResponseByQuery(t *testing.T, queryHandler *QueryHandler, responseByQue
 					&pgproto3.DataRow{},
 					&pgproto3.CommandComplete{},
 				})
-				testDataRowValues(t, messages[1], responses["values"])
+				if len(messages) == 3 {
+					testDataRowValues(t, messages[1], responses["values"])
+				}
 			} else {
 				testMessageTypes(t, messages, []pgproto3.Message{
 					&pgproto3.RowDescription{},
