@@ -224,6 +224,26 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
 				"values":      {"b", "x"},
 			},
+			"SELECT key, value FROM jsonb_each('{\"a\": 1, \"b\": \"x\"}') WHERE key = 'b'": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"b", "\"x\""},
+			},
+			"SELECT key, value FROM json_each_text('{\"a\": 1, \"b\": \"x\"}') WHERE key = 'b'": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"b", "x"},
+			},
+			"SELECT json_object_keys FROM json_object_keys('{\"k1\": 1, \"k2\": 2}') WHERE json_object_keys = 'k2'": {
+				"description": {"json_object_keys"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"k2"},
+			},
+			"SELECT jsonb_object_keys FROM jsonb_object_keys('{\"k1\": 1, \"k2\": 2}') WHERE jsonb_object_keys = 'k1'": {
+				"description": {"jsonb_object_keys"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"k1"},
+			},
 			"SELECT json_object_keys(json_column) AS key FROM public.test_table WHERE json_column IS NOT NULL": {
 				"description": {"key"},
 				"types":       {Uint32ToString(pgtype.TextOID)},
