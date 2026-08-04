@@ -23,7 +23,8 @@ func (parser *ParserFunction) FirstArgumentToString(functionCall *pgQuery.FuncCa
 	if len(functionCall.Args) < 1 {
 		return ""
 	}
-	return functionCall.Args[0].GetAConst().GetSval().Sval
+	// Nil-safe getter chain: returns "" for non-constant and non-string-constant arguments
+	return functionCall.Args[0].GetAConst().GetSval().GetSval()
 }
 
 // n from (FUNCTION()).n
@@ -130,11 +131,12 @@ func (parser *ParserFunction) RemapToFunction(functionCall *pgQuery.FuncCall, na
 }
 
 func (parser *ParserFunction) constStringValue(node *pgQuery.Node) string {
+	// Nil-safe getter chains: return "" for non-string constants (e.g. integers) instead of panicking
 	if node.GetAConst() != nil {
-		return node.GetAConst().GetSval().Sval
+		return node.GetAConst().GetSval().GetSval()
 	}
 	if typeCast := node.GetTypeCast(); typeCast != nil && typeCast.Arg.GetAConst() != nil {
-		return typeCast.Arg.GetAConst().GetSval().Sval
+		return typeCast.Arg.GetAConst().GetSval().GetSval()
 	}
 	return ""
 }
@@ -288,9 +290,15 @@ func (parser *ParserFunction) RemapJsonbExtractPathText(functionCall *pgQuery.Fu
 	}
 
 	pathArgs := functionCall.Args[1:]
-	// jsonb_extract_path_text(json, VARIADIC ARRAY['a', 'b'])
-	if arrayExpr := functionCall.Args[1].GetAArrayExpr(); functionCall.FuncVariadic && arrayExpr != nil {
-		pathArgs = arrayExpr.Elements
+	// jsonb_extract_path_text(json, VARIADIC ARRAY['a', 'b']) with an optional ::text[] cast around the ARRAY
+	if functionCall.FuncVariadic {
+		arrayNode := functionCall.Args[1]
+		if typeCast := arrayNode.GetTypeCast(); typeCast != nil {
+			arrayNode = typeCast.Arg
+		}
+		if arrayExpr := arrayNode.GetAArrayExpr(); arrayExpr != nil {
+			pathArgs = arrayExpr.Elements
+		}
 	}
 
 	pathParts := []string{"$"}

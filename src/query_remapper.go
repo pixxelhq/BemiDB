@@ -163,11 +163,6 @@ func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.Sel
 		remapper.remapSelectStatement(rightSelectStatement, indentLevel+1) // self-recursion
 	}
 
-	// JOIN
-	if len(selectStatement.FromClause) > 0 && selectStatement.FromClause[0].GetJoinExpr() != nil {
-		selectStatement.FromClause[0] = remapper.remapJoinExpressions(selectStatement, selectStatement.FromClause[0], indentLevel+1) // recursion
-	}
-
 	// WHERE
 	if selectStatement.WhereClause != nil {
 		remapper.traceTreeTraversal("WHERE statements", indentLevel)
@@ -206,6 +201,9 @@ func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.Sel
 				remapper.traceTreeTraversal("FROM function()", indentLevel)
 				remapper.remapperTable.RemapTableFunctionCall(fromNode.GetRangeFunction()) // recursion
 				remapper.remapTableFunctionArgs(fromNode.GetRangeFunction(), indentLevel+1)
+			} else if fromNode.GetJoinExpr() != nil {
+				// FROM [TABLE] JOIN [TABLE] ON ... (at any position in the FROM list, e.g. FROM a, b JOIN c ON ...)
+				selectStatement.FromClause[i] = remapper.remapJoinExpressions(selectStatement, fromNode, indentLevel+1) // recursion
 			}
 		}
 	}
@@ -394,17 +392,10 @@ func (remapper *QueryRemapper) remappedExpressions(node *pgQuery.Node, indentLev
 
 // FROM FUNCTION(args) -> remap expressions in args (e.g. '...'::jsonb casts, schema.table.column references)
 func (remapper *QueryRemapper) remapTableFunctionArgs(rangeFunction *pgQuery.RangeFunction, indentLevel int) {
-	for _, funcNode := range rangeFunction.Functions {
-		for _, funcItemNode := range funcNode.GetList().Items {
-			functionCall := funcItemNode.GetFuncCall()
-			if functionCall == nil {
-				continue
-			}
-
-			for i, arg := range functionCall.Args {
-				if arg != nil {
-					functionCall.Args[i] = remapper.remappedExpressions(arg, indentLevel) // recursion
-				}
+	for _, functionCall := range remapper.remapperTable.TableFunctionCalls(rangeFunction) {
+		for i, arg := range functionCall.Args {
+			if arg != nil {
+				functionCall.Args[i] = remapper.remappedExpressions(arg, indentLevel) // recursion
 			}
 		}
 	}

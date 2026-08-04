@@ -149,6 +149,21 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {Uint32ToString(pgtype.TextOID)},
 				"values":      {"value"},
 			},
+			"SELECT jsonb_extract_path_text(json_column, VARIADIC ARRAY['key']::text[]) AS jsonb_extract_path_text FROM test_table LIMIT 1": {
+				"description": {"jsonb_extract_path_text"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"value"},
+			},
+			"SELECT bemidb_last_synced_at(123) AS last_synced_at": {
+				"description": {"last_synced_at"},
+				"types":       {Uint32ToString(pgtype.TimestamptzOID)},
+				"values":      {""},
+			},
+			"SELECT 1 AS value WHERE 1 = ANY(123)": {
+				"description": {"value"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {},
+			},
 			"SELECT encode(sha256('foo'), 'hex'::text) AS encode": {
 				"description": {"encode"},
 				"types":       {Uint32ToString(pgtype.TextOID)},
@@ -238,6 +253,16 @@ func TestHandleQuery(t *testing.T) {
 				"description": {"job_id", "value"},
 				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
 				"values":      {"2", ""},
+			},
+			"SELECT t1.id AS id, c.value AS value FROM (VALUES (1)) t1 (id), (VALUES (2)) t2 (y) JOIN jsonb_array_elements('[5]') c ON true": {
+				"description": {"id", "value"},
+				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"1", "5"},
+			},
+			"SELECT COUNT(*) AS count FROM (VALUES (1)) v (x), public.test_table t1 JOIN public.test_table t2 ON t2.id = t1.id": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"2"},
 			},
 		})
 	})
@@ -1727,8 +1752,9 @@ func testNoError(t *testing.T, err error) {
 
 func testMessageTypes(t *testing.T, messages []pgproto3.Message, expectedTypes []pgproto3.Message) {
 	if len(messages) != len(expectedTypes) {
-		t.Errorf("Expected %v messages, got %v", len(expectedTypes), len(messages))
-		return // Fail instead of panicking with index out of range below (which aborts the whole test suite)
+		// Fatal instead of panicking with index out of range below (which aborts the whole test suite).
+		// This also protects callers that index into messages[N] right after this check.
+		t.Fatalf("Expected %v messages, got %v", len(expectedTypes), len(messages))
 	}
 
 	for i, expectedType := range expectedTypes {
@@ -1806,9 +1832,7 @@ func testResponseByQuery(t *testing.T, queryHandler *QueryHandler, responseByQue
 					&pgproto3.DataRow{},
 					&pgproto3.CommandComplete{},
 				})
-				if len(messages) == 3 {
-					testDataRowValues(t, messages[1], responses["values"])
-				}
+				testDataRowValues(t, messages[1], responses["values"])
 			} else {
 				testMessageTypes(t, messages, []pgproto3.Message{
 					&pgproto3.RowDescription{},
