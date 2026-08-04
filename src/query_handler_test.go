@@ -172,6 +172,76 @@ func TestHandleQuery(t *testing.T) {
 		})
 	})
 
+	t.Run("JSON functions", func(t *testing.T) {
+		testResponseByQuery(t, queryHandler, map[string]map[string][]string{
+			"SELECT json_array_elements('[{\"a\":1},{\"a\":2}]') LIMIT 1": {
+				"description": {"json_array_elements"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"{\"a\":1}"},
+			},
+			"SELECT jsonb_array_elements(NULL) AS element": {
+				"description": {"element"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {},
+			},
+			"SELECT COUNT(*) AS count FROM jsonb_array_elements('[1, 2, 3]')": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"3"},
+			},
+			"SELECT value FROM pg_catalog.json_array_elements('[\"x\"]')": {
+				"description": {"value"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"\"x\""},
+			},
+			"SELECT value FROM json_array_elements_text('[\"first\", \"second\"]') LIMIT 1": {
+				"description": {"value"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"first"},
+			},
+			"SELECT key, value FROM json_each('{\"a\": 1, \"b\": \"x\"}') WHERE key = 'b'": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"b", "\"x\""},
+			},
+			"SELECT key, value FROM jsonb_each_text('{\"a\": 1, \"b\": \"x\"}') WHERE key = 'b'": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"b", "x"},
+			},
+			"SELECT json_object_keys(json_column) AS key FROM public.test_table WHERE json_column IS NOT NULL": {
+				"description": {"key"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"key"},
+			},
+			"SELECT '{\"a\": {\"b\": 2}}'::jsonb->'a'->>'b' AS value": {
+				"description": {"value"},
+				"types":       {Uint32ToString(pgtype.TextOID)},
+				"values":      {"2"},
+			},
+			"SELECT t.id, json_extract_string(c.value, '$.aoi') AS aoi FROM (VALUES (1, '{\"components\": [{\"aoi\": \"area-77\"}]}')) t (id, spec), jsonb_array_elements(t.spec->'components') c": {
+				"description": {"id", "aoi"},
+				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"1", "area-77"},
+			},
+			"SELECT e.key, e.value FROM public.test_table tt, json_each(tt.json_column) e WHERE tt.json_column IS NOT NULL": {
+				"description": {"key", "value"},
+				"types":       {Uint32ToString(pgtype.TextOID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"key", "\"value\""},
+			},
+			"SELECT j.job_id, c.value ->> 'type' AS type FROM (VALUES (1, '{\"components\": [{\"type\": \"aoi\"}]}')) j (job_id, spec) CROSS JOIN LATERAL jsonb_array_elements(j.spec::jsonb -> 'components') c": {
+				"description": {"job_id", "type"},
+				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"1", "aoi"},
+			},
+			"SELECT j.job_id, c.value FROM (VALUES (2, '{\"components\": []}')) j (job_id, spec) LEFT JOIN LATERAL jsonb_array_elements(j.spec::jsonb -> 'components') c ON true": {
+				"description": {"job_id", "value"},
+				"types":       {Uint32ToString(pgtype.Int4OID), Uint32ToString(pgtype.TextOID)},
+				"values":      {"2", ""},
+			},
+		})
+	})
+
 	t.Run("PG system tables", func(t *testing.T) {
 		testResponseByQuery(t, queryHandler, map[string]map[string][]string{
 			"SELECT oid, typname AS typename FROM pg_type WHERE typname='geometry' OR typname='geography'": {

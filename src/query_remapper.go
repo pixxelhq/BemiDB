@@ -204,7 +204,8 @@ func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.Sel
 			} else if fromNode.GetRangeFunction() != nil {
 				// FROM PG_FUNCTION()
 				remapper.traceTreeTraversal("FROM function()", indentLevel)
-				remapper.remapperTable.RemapTableFunctionCall(fromNode.GetRangeFunction()) // recursion
+				remapper.remapperTable.RemapTableFunctionCall(fromNode.GetRangeFunction())  // recursion
+				remapper.remapTableFunctionArgs(fromNode.GetRangeFunction(), indentLevel+1) // recursion
 			}
 		}
 	}
@@ -241,6 +242,11 @@ func (remapper *QueryRemapper) remapJoinExpressions(selectStatement *pgQuery.Sel
 	} else if leftJoinNode.GetRangeSubselect() != nil {
 		leftSelectStatement := leftJoinNode.GetRangeSubselect().Subquery.GetSelectStmt()
 		remapper.remapSelectStatement(leftSelectStatement, indentLevel+1) // parent-recursion
+	} else if leftJoinNode.GetRangeFunction() != nil {
+		// JOIN [LATERAL] FUNCTION() left
+		remapper.traceTreeTraversal("FUNCTION() left", indentLevel+1)
+		remapper.remapperTable.RemapTableFunctionCall(leftJoinNode.GetRangeFunction())
+		remapper.remapTableFunctionArgs(leftJoinNode.GetRangeFunction(), indentLevel+1) // recursion
 	}
 	node.GetJoinExpr().Larg = leftJoinNode
 
@@ -255,6 +261,11 @@ func (remapper *QueryRemapper) remapJoinExpressions(selectStatement *pgQuery.Sel
 	} else if rightJoinNode.GetRangeSubselect() != nil {
 		rightSelectStatement := rightJoinNode.GetRangeSubselect().Subquery.GetSelectStmt()
 		remapper.remapSelectStatement(rightSelectStatement, indentLevel+1) // parent-recursion
+	} else if rightJoinNode.GetRangeFunction() != nil {
+		// JOIN [LATERAL] FUNCTION() right
+		remapper.traceTreeTraversal("FUNCTION() right", indentLevel+1)
+		remapper.remapperTable.RemapTableFunctionCall(rightJoinNode.GetRangeFunction())
+		remapper.remapTableFunctionArgs(rightJoinNode.GetRangeFunction(), indentLevel+1) // recursion
 	}
 	node.GetJoinExpr().Rarg = rightJoinNode
 
@@ -379,6 +390,24 @@ func (remapper *QueryRemapper) remappedExpressions(node *pgQuery.Node, indentLev
 	}
 
 	return remapper.remapperExpression.RemappedExpression(node)
+}
+
+// FROM FUNCTION(args) -> remap expressions in args (e.g. '...'::jsonb casts, schema.table.column references)
+func (remapper *QueryRemapper) remapTableFunctionArgs(rangeFunction *pgQuery.RangeFunction, indentLevel int) {
+	for _, funcNode := range rangeFunction.Functions {
+		for _, funcItemNode := range funcNode.GetList().Items {
+			functionCall := funcItemNode.GetFuncCall()
+			if functionCall == nil {
+				continue
+			}
+
+			for i, arg := range functionCall.Args {
+				if arg != nil {
+					functionCall.Args[i] = remapper.remappedExpressions(arg, indentLevel) // recursion
+				}
+			}
+		}
+	}
 }
 
 // CASE ...
