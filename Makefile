@@ -91,5 +91,7 @@ sniff:
 measure-mem:
 	devbox run "./benchmark/scripts/measure-memory.sh"
 
+# Requires the server to run with BEMIDB_ENABLE_PPROF=true (or --enable-pprof),
+# which serves pprof on :6060. (Previously tied to BEMIDB_LOG_LEVEL=TRACE.)
 profile-mem:
 	devbox run "watch -n 1 go tool pprof -top http://localhost:6060/debug/pprof/heap"

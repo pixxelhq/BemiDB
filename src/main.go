@@ -19,7 +19,7 @@ func main() {
 	config := LoadConfig()
 	defer handlePanic(config)
 
-	if config.LogLevel == LOG_LEVEL_TRACE {
+	if config.EnablePprof {
 		go enableProfiling()
 	}
 
@@ -34,6 +34,11 @@ func main() {
 		start(config)
 	case COMMAND_SYNC:
 		LogDebug(config, "Syncing with BemiDB v"+VERSION)
+		// The sync/merge path creates short-lived DuckDB instances (see NewMergeDuckdb),
+		// so there is no single engine to interrogate — a nil handle still records RSS,
+		// Go heap, and goroutines, the numbers a sync OOM post-mortem needs.
+		StartMemoryMonitor(config, nil)
+		StartMetricsServer(config, nil)
 		if config.Pg.SyncInterval != "" {
 			duration, err := time.ParseDuration(config.Pg.SyncInterval)
 			if err != nil {
@@ -70,6 +75,12 @@ func start(config *Config) {
 	LogInfo(config, "DuckDB: Connected")
 	defer duckdb.Close()
 
+	// Memory observability (see memory_monitor.go): both read the same three numbers —
+	// the sampler logs them so the last one survives an OOM in --previous logs; the
+	// metrics server exposes them for continuous Prometheus scraping.
+	StartMemoryMonitor(config, duckdb)
+	StartMetricsServer(config, duckdb)
+
 	icebergReader := NewIcebergReader(config)
 	duckdb.ExecFile(icebergReader.InternalStartSqlFile())
 
@@ -95,14 +106,17 @@ func syncFromPg(config *Config) {
 }
 
 func enableProfiling() {
-	func() { log.Println(http.ListenAndServe(":6060", nil)) }()
+	log.Println(http.ListenAndServe(":"+PPROF_PORT, nil))
 }
 
+// recover() must be called directly by the deferred function (`defer handlePanic(config)`)
+// to intercept the panic — wrapped in a nested closure it always returns nil.
 func handlePanic(config *Config) {
-	func() {
-		if r := recover(); r != nil {
-			err, _ := r.(error)
-			HandleUnexpectedError(config, err)
+	if r := recover(); r != nil {
+		err, ok := r.(error)
+		if !ok {
+			err = fmt.Errorf("%v", r)
 		}
-	}()
+		HandleUnexpectedError(config, err)
+	}
 }
