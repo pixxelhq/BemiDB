@@ -19,7 +19,7 @@ func main() {
 	config := LoadConfig()
 	defer handlePanic(config)
 
-	if config.LogLevel == LOG_LEVEL_TRACE {
+	if config.EnablePprof {
 		go enableProfiling()
 	}
 
@@ -69,6 +69,12 @@ func start(config *Config) {
 	duckdb := NewDuckdb(config, true)
 	LogInfo(config, "DuckDB: Connected")
 	defer duckdb.Close()
+
+	// Memory observability (see memory_monitor.go): both read the same three numbers —
+	// the sampler logs them so the last one survives an OOM in --previous logs; the
+	// metrics server exposes them for continuous Prometheus scraping.
+	StartMemoryMonitor(config, duckdb)
+	StartMetricsServer(config, duckdb)
 
 	icebergReader := NewIcebergReader(config)
 	duckdb.ExecFile(icebergReader.InternalStartSqlFile())

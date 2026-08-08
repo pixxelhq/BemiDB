@@ -44,6 +44,10 @@ const (
 	ENV_ENABLE_CACHE                 = "BEMIDB_ENABLE_CACHE"
 	ENV_ENABLE_HTTP_CONNECTION_CACHE = "BEMIDB_ENABLE_HTTP_CONNECTION_CACHE"
 
+	ENV_ENABLE_PPROF          = "BEMIDB_ENABLE_PPROF"
+	ENV_METRICS_PORT          = "BEMIDB_METRICS_PORT"
+	ENV_MEMORY_SAMPLE_SECONDS = "BEMIDB_MEMORY_SAMPLE_SECONDS"
+
 	ENV_DUCKDB_MEMORY_LIMIT   = "BEMIDB_DUCKDB_MEMORY_LIMIT"
 	ENV_DUCKDB_TEMP_DIRECTORY = "BEMIDB_DUCKDB_TEMP_DIRECTORY"
 	ENV_DUCKDB_THREADS        = "BEMIDB_DUCKDB_THREADS"
@@ -98,6 +102,9 @@ type Config struct {
 	EncryptedPassword         string
 	EnableCache               bool
 	EnableHttpConnectionCache bool
+	EnablePprof               bool
+	MetricsPort               string
+	MemorySampleSeconds       int
 	DuckDbMemoryLimit         string
 	DuckDbTempDirectory       string
 	DuckDbThreads             int
@@ -134,6 +141,9 @@ func registerFlags() {
 	flag.StringVar(&_configParseValues.password, "password", os.Getenv(ENV_PASSWORD), "Database password. Default: \""+DEFAULT_PASSWORD+"\"")
 	flag.BoolVar(&_config.EnableCache, "enable-cache", os.Getenv(ENV_ENABLE_CACHE) == "true", "Enable DuckDB HTTP metadata cache for remote files. Default: false")
 	flag.BoolVar(&_config.EnableHttpConnectionCache, "enable-http-connection-cache", os.Getenv(ENV_ENABLE_HTTP_CONNECTION_CACHE) == "true", "Enable DuckDB HTTP connection keep-alive for remote files. Default: false")
+	flag.BoolVar(&_config.EnablePprof, "enable-pprof", os.Getenv(ENV_ENABLE_PPROF) == "true", "(Optional) Serve Go pprof profiles on :6060 for ad-hoc debugging. Default: false")
+	flag.StringVar(&_config.MetricsPort, "metrics-port", os.Getenv(ENV_METRICS_PORT), "(Optional) Port to serve Prometheus metrics on at /metrics (process RSS, Go heap, DuckDB memory). Empty disables it.")
+	flag.IntVar(&_config.MemorySampleSeconds, "memory-sample-seconds", intFromEnv(ENV_MEMORY_SAMPLE_SECONDS), "(Optional) Log a memory sample (RSS, Go heap, DuckDB memory) every N seconds. 0 disables it.")
 	flag.StringVar(&_config.DuckDbMemoryLimit, "duckdb-memory-limit", os.Getenv(ENV_DUCKDB_MEMORY_LIMIT), "(Optional) DuckDB memory_limit, e.g. \"4GB\". Bounds DuckDB memory; it spills to the temp directory when exceeded. Set below the container memory limit.")
 	flag.StringVar(&_config.DuckDbTempDirectory, "duckdb-temp-directory", os.Getenv(ENV_DUCKDB_TEMP_DIRECTORY), "(Optional) DuckDB temp_directory for spilling to disk. Defaults to the OS temp dir so a memory limit can spill instead of erroring.")
 	flag.IntVar(&_config.DuckDbThreads, "duckdb-threads", intFromEnv(ENV_DUCKDB_THREADS), "(Optional) DuckDB threads. Caps scan parallelism to bound peak memory. Defaults to DuckDB's own default (all host cores).")
