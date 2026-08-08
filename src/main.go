@@ -109,11 +109,14 @@ func enableProfiling() {
 	log.Println(http.ListenAndServe(":"+PPROF_PORT, nil))
 }
 
+// recover() must be called directly by the deferred function (`defer handlePanic(config)`)
+// to intercept the panic — wrapped in a nested closure it always returns nil.
 func handlePanic(config *Config) {
-	func() {
-		if r := recover(); r != nil {
-			err, _ := r.(error)
-			HandleUnexpectedError(config, err)
+	if r := recover(); r != nil {
+		err, ok := r.(error)
+		if !ok {
+			err = fmt.Errorf("%v", r)
 		}
-	}()
+		HandleUnexpectedError(config, err)
+	}
 }
