@@ -3,11 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -32,15 +31,23 @@ type MemorySample struct {
 	Goroutines     int
 }
 
-func sampleMemory(config *Config, duckdb *Duckdb) MemorySample {
+// sampleMemory gathers one sample. duckdb may be nil (the sync command creates
+// short-lived DuckDB instances per merge, so there is no engine to interrogate);
+// DuckDbBytes is then the -1 "unavailable" sentinel.
+func sampleMemory(ctx context.Context, duckdb *Duckdb) MemorySample {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
 	rss := processRssBytes()
-	duckDbBytes := duckDbMemoryBytes(duckdb)
+	duckDbBytes := duckDbMemoryBytes(ctx, duckdb)
 
 	// Untracked = RSS we can't attribute to the Go heap or DuckDB's own accounting.
-	untracked := rss - int64(memStats.HeapAlloc) - duckDbBytes
+	// The -1 sentinel must not join the arithmetic: subtracting it would reclassify
+	// the entire (unknown) DuckDB footprint as "untracked".
+	untracked := rss - int64(memStats.HeapAlloc)
+	if duckDbBytes >= 0 {
+		untracked -= duckDbBytes
+	}
 	if untracked < 0 {
 		untracked = 0
 	}
@@ -55,13 +62,21 @@ func sampleMemory(config *Config, duckdb *Duckdb) MemorySample {
 	}
 }
 
-// processRssBytes returns the memory the OOM killer accounts for. cgroup v2's
-// memory.current is the truest match inside a container; /proc/self/status VmRSS is
-// the fallback outside one. Returns 0 if neither is readable.
+// processRssBytes returns the memory the OOM killer accounts for: cgroup v2's
+// memory.current, then cgroup v1's memory.usage_in_bytes — both charge page cache
+// (e.g. DuckDB temp spill) to the container the way the OOM killer does. VmRSS is
+// the last-resort fallback outside cgroups; it counts only mapped pages, so it can
+// understate OOM-relevant usage. Returns 0 if nothing is readable.
 func processRssBytes() int64 {
-	if data, err := os.ReadFile("/sys/fs/cgroup/memory.current"); err == nil {
-		if v, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
-			return v
+	cgroupPaths := []string{
+		"/sys/fs/cgroup/memory.current",               // cgroup v2
+		"/sys/fs/cgroup/memory/memory.usage_in_bytes", // cgroup v1
+	}
+	for _, path := range cgroupPaths {
+		if data, err := os.ReadFile(path); err == nil {
+			if v, err := StringToInt64(strings.TrimSpace(string(data))); err == nil {
+				return v
+			}
 		}
 	}
 	if data, err := os.ReadFile("/proc/self/status"); err == nil {
@@ -69,7 +84,7 @@ func processRssBytes() int64 {
 			if strings.HasPrefix(line, "VmRSS:") {
 				fields := strings.Fields(line)
 				if len(fields) >= 2 {
-					if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					if kb, err := StringToInt64(fields[1]); err == nil {
 						return kb * 1024
 					}
 				}
@@ -79,21 +94,33 @@ func processRssBytes() int64 {
 	return 0
 }
 
-// duckDbMemoryBytes sums DuckDB's own tracked memory. Returns -1 if the query fails
-// (e.g. a future engine drops the function) so the caller can tell "unavailable"
-// apart from a real zero.
-func duckDbMemoryBytes(duckdb *Duckdb) int64 {
-	rows, err := duckdb.QueryContext(context.Background(), "SELECT COALESCE(sum(memory_usage_bytes), 0) FROM duckdb_memory()")
+// duckDbMemoryBytes sums DuckDB's own tracked memory. Returns -1 when it is
+// unavailable — nil duckdb, query error (e.g. a future engine drops the function),
+// or timeout — so the caller can tell "unavailable" apart from a real zero. The
+// timeout matters: without it, an engine wedged by the very memory pressure being
+// observed would hang the sampler right when its output is needed.
+func duckDbMemoryBytes(ctx context.Context, duckdb *Duckdb) int64 {
+	if duckdb == nil {
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	rows, err := duckdb.QueryContext(ctx, "SELECT COALESCE(sum(memory_usage_bytes), 0) FROM duckdb_memory()")
 	if err != nil {
 		return -1
 	}
 	defer rows.Close()
 
+	if !rows.Next() {
+		return -1
+	}
 	var bytes int64
-	if rows.Next() {
-		if err := rows.Scan(&bytes); err != nil {
-			return -1
-		}
+	if err := rows.Scan(&bytes); err != nil {
+		return -1
+	}
+	if rows.Err() != nil {
+		return -1
 	}
 	return bytes
 }
@@ -102,36 +129,44 @@ func duckDbMemoryBytes(duckdb *Duckdb) int64 {
 // the black-box recorder: an OOM leaves no dying words, but the last sample before
 // the kill survives in the previous container's logs (kubectl logs --previous).
 func StartMemoryMonitor(config *Config, duckdb *Duckdb) {
-	if config.MemorySampleSeconds <= 0 {
+	// Guarding the computed Duration (not the int) also rejects values large enough
+	// to overflow the multiplication, which would panic time.NewTicker.
+	interval := time.Duration(config.MemorySampleSeconds) * time.Second
+	if interval <= 0 {
 		return
 	}
 	go func() {
-		ticker := time.NewTicker(time.Duration(config.MemorySampleSeconds) * time.Second)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for range ticker.C {
-			s := sampleMemory(config, duckdb)
+			s := sampleMemory(context.Background(), duckdb)
 			LogInfo(config, "Memory sample:",
 				"rss="+formatMiB(s.RssBytes),
 				"go_heap="+formatMiB(s.GoHeapBytes),
+				"go_sys="+formatMiB(s.GoSysBytes),
 				"duckdb="+formatMiB(s.DuckDbBytes),
 				"untracked="+formatMiB(s.UntrackedBytes),
-				"goroutines="+strconv.Itoa(s.Goroutines),
+				"goroutines="+IntToString(s.Goroutines),
 			)
 		}
 	}()
 }
 
-func metricsExposition(w io.Writer, s MemorySample) {
-	if rw, ok := w.(http.ResponseWriter); ok {
-		rw.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	}
+func metricsExposition(w http.ResponseWriter, s MemorySample) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintf(w, "# HELP bemidb_process_rss_bytes Resident set size the OOM killer accounts for.\n")
 	fmt.Fprintf(w, "# TYPE bemidb_process_rss_bytes gauge\nbemidb_process_rss_bytes %d\n", s.RssBytes)
 	fmt.Fprintf(w, "# HELP bemidb_go_heap_bytes Go heap in use (runtime.MemStats HeapAlloc).\n")
 	fmt.Fprintf(w, "# TYPE bemidb_go_heap_bytes gauge\nbemidb_go_heap_bytes %d\n", s.GoHeapBytes)
-	fmt.Fprintf(w, "# HELP bemidb_duckdb_bytes DuckDB tracked memory (duckdb_memory()); -1 if unavailable.\n")
-	fmt.Fprintf(w, "# TYPE bemidb_duckdb_bytes gauge\nbemidb_duckdb_bytes %d\n", s.DuckDbBytes)
-	fmt.Fprintf(w, "# HELP bemidb_untracked_bytes RSS not attributable to the Go heap or DuckDB.\n")
+	fmt.Fprintf(w, "# HELP bemidb_go_sys_bytes Total memory the Go runtime obtained from the OS (runtime.MemStats Sys).\n")
+	fmt.Fprintf(w, "# TYPE bemidb_go_sys_bytes gauge\nbemidb_go_sys_bytes %d\n", s.GoSysBytes)
+	// Absent — not -1 — when unavailable: a sentinel sample would silently corrupt
+	// Prometheus sum/avg aggregations, while an absent series models "unknown".
+	if s.DuckDbBytes >= 0 {
+		fmt.Fprintf(w, "# HELP bemidb_duckdb_bytes DuckDB tracked memory (duckdb_memory()); absent if unavailable.\n")
+		fmt.Fprintf(w, "# TYPE bemidb_duckdb_bytes gauge\nbemidb_duckdb_bytes %d\n", s.DuckDbBytes)
+	}
+	fmt.Fprintf(w, "# HELP bemidb_untracked_bytes RSS not attributable to the Go heap or DuckDB's tracked memory.\n")
 	fmt.Fprintf(w, "# TYPE bemidb_untracked_bytes gauge\nbemidb_untracked_bytes %d\n", s.UntrackedBytes)
 	fmt.Fprintf(w, "# HELP bemidb_goroutines Number of Go goroutines (proxy for concurrent connections/queries).\n")
 	fmt.Fprintf(w, "# TYPE bemidb_goroutines gauge\nbemidb_goroutines %d\n", s.Goroutines)
@@ -141,23 +176,39 @@ func formatMiB(bytes int64) string {
 	if bytes < 0 {
 		return "n/a"
 	}
-	return strconv.FormatInt(bytes/(1024*1024), 10) + "MiB"
+	return Int64ToString(bytes/(1024*1024)) + "MiB"
 }
 
 // StartMetricsServer serves Prometheus metrics at /metrics on config.MetricsPort.
-// Hand-written exposition format avoids a new dependency for three gauges.
+// Hand-written exposition format avoids a new dependency for a handful of gauges.
 func StartMetricsServer(config *Config, duckdb *Duckdb) {
 	if config.MetricsPort == "" {
 		return
 	}
+	// Bind synchronously so a taken or malformed port fails loudly at startup,
+	// instead of logging success and then dying quietly in a goroutine.
+	listener, err := net.Listen("tcp", ":"+config.MetricsPort)
+	if err != nil {
+		LogError(config, "Metrics: failed to listen on :"+config.MetricsPort+":", err)
+		return
+	}
+	LogInfo(config, "Metrics: serving /metrics on :"+config.MetricsPort)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		metricsExposition(w, sampleMemory(config, duckdb))
+		metricsExposition(w, sampleMemory(r.Context(), duckdb))
 	})
+	// Explicit timeouts: the zero-value http.Server has none, letting slow or
+	// half-open clients pin goroutines and buffers forever.
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
-		LogInfo(config, "Metrics: serving /metrics on :"+config.MetricsPort)
-		server := &http.Server{Addr: ":" + config.MetricsPort, Handler: mux}
-		if err := server.ListenAndServe(); err != nil {
+		if err := server.Serve(listener); err != nil {
 			LogError(config, "Metrics server stopped:", err)
 		}
 	}()

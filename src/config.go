@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"slices"
 	"strconv"
@@ -9,10 +10,18 @@ import (
 )
 
 func intFromEnv(key string) int {
-	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
-		return v
+	value := os.Getenv(key)
+	if value == "" {
+		return 0
 	}
-	return 0
+	v, err := strconv.Atoi(value)
+	if err != nil {
+		// Fail fast: silently mapping a typo like "30s" to 0 would disable the feature
+		// (or a protective cap) while the operator believes it is on.
+		fmt.Fprintln(os.Stderr, "Invalid "+key+" value \""+value+"\": expected an integer")
+		os.Exit(1)
+	}
+	return v
 }
 
 const (
@@ -69,6 +78,8 @@ const (
 	DEFAULT_DB_STORAGE_TYPE = "LOCAL"
 
 	DEFAULT_AWS_S3_ENDPOINT = "s3.amazonaws.com"
+
+	PPROF_PORT = "6060"
 
 	STORAGE_TYPE_LOCAL = "LOCAL"
 	STORAGE_TYPE_S3    = "S3"
@@ -141,7 +152,7 @@ func registerFlags() {
 	flag.StringVar(&_configParseValues.password, "password", os.Getenv(ENV_PASSWORD), "Database password. Default: \""+DEFAULT_PASSWORD+"\"")
 	flag.BoolVar(&_config.EnableCache, "enable-cache", os.Getenv(ENV_ENABLE_CACHE) == "true", "Enable DuckDB HTTP metadata cache for remote files. Default: false")
 	flag.BoolVar(&_config.EnableHttpConnectionCache, "enable-http-connection-cache", os.Getenv(ENV_ENABLE_HTTP_CONNECTION_CACHE) == "true", "Enable DuckDB HTTP connection keep-alive for remote files. Default: false")
-	flag.BoolVar(&_config.EnablePprof, "enable-pprof", os.Getenv(ENV_ENABLE_PPROF) == "true", "(Optional) Serve Go pprof profiles on :6060 for ad-hoc debugging. Default: false")
+	flag.BoolVar(&_config.EnablePprof, "enable-pprof", os.Getenv(ENV_ENABLE_PPROF) == "true", "(Optional) Serve Go pprof profiles on :"+PPROF_PORT+" for ad-hoc debugging. Default: false")
 	flag.StringVar(&_config.MetricsPort, "metrics-port", os.Getenv(ENV_METRICS_PORT), "(Optional) Port to serve Prometheus metrics on at /metrics (process RSS, Go heap, DuckDB memory). Empty disables it.")
 	flag.IntVar(&_config.MemorySampleSeconds, "memory-sample-seconds", intFromEnv(ENV_MEMORY_SAMPLE_SECONDS), "(Optional) Log a memory sample (RSS, Go heap, DuckDB memory) every N seconds. 0 disables it.")
 	flag.StringVar(&_config.DuckDbMemoryLimit, "duckdb-memory-limit", os.Getenv(ENV_DUCKDB_MEMORY_LIMIT), "(Optional) DuckDB memory_limit, e.g. \"4GB\". Bounds DuckDB memory; it spills to the temp directory when exceeded. Set below the container memory limit.")

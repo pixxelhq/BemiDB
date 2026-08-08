@@ -34,6 +34,11 @@ func main() {
 		start(config)
 	case COMMAND_SYNC:
 		LogDebug(config, "Syncing with BemiDB v"+VERSION)
+		// The sync/merge path creates short-lived DuckDB instances (see NewMergeDuckdb),
+		// so there is no single engine to interrogate — a nil handle still records RSS,
+		// Go heap, and goroutines, the numbers a sync OOM post-mortem needs.
+		StartMemoryMonitor(config, nil)
+		StartMetricsServer(config, nil)
 		if config.Pg.SyncInterval != "" {
 			duration, err := time.ParseDuration(config.Pg.SyncInterval)
 			if err != nil {
@@ -101,7 +106,7 @@ func syncFromPg(config *Config) {
 }
 
 func enableProfiling() {
-	func() { log.Println(http.ListenAndServe(":6060", nil)) }()
+	log.Println(http.ListenAndServe(":"+PPROF_PORT, nil))
 }
 
 func handlePanic(config *Config) {
