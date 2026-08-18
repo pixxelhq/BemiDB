@@ -386,7 +386,7 @@ func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, prepar
 	}
 
 	if message.PreparedStatement != preparedStatement.Name {
-		return nil, nil, fmt.Errorf("prepared statement mismatch, %s instead of %s: %s", message.PreparedStatement, preparedStatement.Name, preparedStatement.OriginalQuery)
+		return nil, preparedStatement, fmt.Errorf("prepared statement mismatch, %s instead of %s: %s", message.PreparedStatement, preparedStatement.Name, preparedStatement.OriginalQuery)
 	}
 
 	var variables []interface{}
@@ -407,7 +407,7 @@ func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, prepar
 		if textFormat {
 			val, err := castTextParam(string(param), preparedStatement.ParameterOIDs, i)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to cast parameter %d: %w. Original query: %s", i, err, preparedStatement.OriginalQuery)
+				return nil, preparedStatement, fmt.Errorf("failed to cast parameter %d: %w. Original query: %s", i, err, preparedStatement.OriginalQuery)
 			}
 			variables = append(variables, val)
 		} else if len(param) == 4 {
@@ -417,7 +417,7 @@ func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, prepar
 		} else if len(param) == 16 {
 			variables = append(variables, uuid.UUID(param).String())
 		} else {
-			return nil, nil, fmt.Errorf("unsupported parameter format: %v (length %d). Original query: %s", param, len(param), preparedStatement.OriginalQuery)
+			return nil, preparedStatement, fmt.Errorf("unsupported parameter format: %v (length %d). Original query: %s", param, len(param), preparedStatement.OriginalQuery)
 		}
 	}
 
@@ -467,9 +467,9 @@ func castTextParam(text string, parameterOIDs []uint32, index int) (interface{},
 
 func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
 	// A repeat Describe would otherwise leak the prior result handle until GC
-	// (mirrors the reset in HandleBindQuery). Like there, this must run before
-	// every error return: on error the caller nils the statement, orphaning
-	// still-open rows beyond the reach of Sync's cleanup.
+	// (mirrors the reset in HandleBindQuery). Error returns hand the statement
+	// back to the caller, so anything still open here stays reachable by the
+	// caller's deferred Close.
 	if preparedStatement.Rows != nil {
 		preparedStatement.Rows.Close()
 		preparedStatement.Rows = nil
@@ -478,11 +478,11 @@ func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe
 	switch message.ObjectType {
 	case 'S': // Statement
 		if message.Name != preparedStatement.Name {
-			return nil, nil, fmt.Errorf("statement mismatch, %s instead of %s: %s", message.Name, preparedStatement.Name, preparedStatement.OriginalQuery)
+			return nil, preparedStatement, fmt.Errorf("statement mismatch, %s instead of %s: %s", message.Name, preparedStatement.Name, preparedStatement.OriginalQuery)
 		}
 	case 'P': // Portal
 		if message.Name != preparedStatement.Portal {
-			return nil, nil, fmt.Errorf("portal mismatch, %s instead of %s: %s", message.Name, preparedStatement.Portal, preparedStatement.OriginalQuery)
+			return nil, preparedStatement, fmt.Errorf("portal mismatch, %s instead of %s: %s", message.Name, preparedStatement.Portal, preparedStatement.OriginalQuery)
 		}
 	}
 
@@ -491,18 +491,18 @@ func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe
 		return []pgproto3.Message{&pgproto3.NoData{}}, preparedStatement, nil
 	}
 	if preparedStatement.Statement == nil { // Statement released by a wire-protocol Close
-		return nil, nil, fmt.Errorf("prepared statement was already closed: %s", preparedStatement.OriginalQuery)
+		return nil, preparedStatement, fmt.Errorf("prepared statement was already closed: %s", preparedStatement.OriginalQuery)
 	}
 
 	rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("couldn't execute statement: %w. Original query: %s", err, preparedStatement.OriginalQuery)
+		return nil, preparedStatement, fmt.Errorf("couldn't execute statement: %w. Original query: %s", err, preparedStatement.OriginalQuery)
 	}
 	preparedStatement.Rows = rows
 
 	messages, err := queryHandler.rowsToDescriptionMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
 	if err != nil {
-		return nil, nil, err
+		return nil, preparedStatement, err
 	}
 	return messages, preparedStatement, nil
 }

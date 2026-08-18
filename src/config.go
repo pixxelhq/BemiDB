@@ -38,6 +38,17 @@ func stringFromEnvOrDefault(key string, defaultValue string) string {
 	return defaultValue
 }
 
+// boolFromEnvDefaultTrue is for flags that default to on: unset/empty is true,
+// and disabling requires an explicit "false"/"0"/"off" (any case) — so that
+// e.g. FALSE or 0 don't silently leave the feature enabled.
+func boolFromEnvDefaultTrue(key string) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "false", "0", "off":
+		return false
+	}
+	return true
+}
+
 const (
 	VERSION = "0.51.1"
 
@@ -95,6 +106,9 @@ const (
 	DEFAULT_DB_STORAGE_TYPE = "LOCAL"
 
 	DEFAULT_AWS_S3_ENDPOINT = "s3.amazonaws.com"
+
+	DEFAULT_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD = "64MB"
+	DEFAULT_DUCKDB_CONN_MAX_LIFETIME_MINUTES = 30
 
 	PPROF_PORT = "6060"
 
@@ -179,9 +193,9 @@ func registerFlags() {
 	flag.StringVar(&_config.DuckDbTempDirectory, "duckdb-temp-directory", os.Getenv(ENV_DUCKDB_TEMP_DIRECTORY), "(Optional) DuckDB temp_directory for spilling to disk. Defaults to the OS temp dir so a memory limit can spill instead of erroring.")
 	flag.IntVar(&_config.DuckDbThreads, "duckdb-threads", intFromEnv(ENV_DUCKDB_THREADS), "(Optional) DuckDB threads. Caps scan parallelism to bound peak memory. Defaults to DuckDB's own default (all host cores).")
 	flag.IntVar(&_config.MaxResultMb, "max-result-mb", intFromEnv(ENV_MAX_RESULT_MB), "(Optional) Maximum result payload in MB per query. Results are buffered in memory before sending, so unbounded results can OOM the process. 0 disables the cap.")
-	flag.BoolVar(&_config.DuckDbAllocatorBackgroundThreads, "duckdb-allocator-background-threads", os.Getenv(ENV_DUCKDB_ALLOCATOR_BACKGROUND_THREADS) != "false", "(Optional) Enable jemalloc background threads so freed memory is returned to the OS instead of retained indefinitely. Default: true; set to false to restore DuckDB's default.")
-	flag.StringVar(&_config.DuckDbAllocatorFlushThreshold, "duckdb-allocator-flush-threshold", stringFromEnvOrDefault(ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD, "64MB"), "(Optional) DuckDB allocator_flush_threshold: flush the allocator after any task that peaked above this. Default: \"64MB\" (DuckDB's own default is 128MB). Empty leaves DuckDB's default.")
-	flag.IntVar(&_config.DuckDbConnMaxLifetimeMinutes, "duckdb-conn-max-lifetime-minutes", intFromEnvOrDefault(ENV_DUCKDB_CONN_MAX_LIFETIME_MINUTES, 30), "(Optional) Recycle pooled DuckDB connections after N minutes (between uses, never mid-query); retained allocator memory is released when a connection closes. Default: 30. 0 disables recycling.")
+	flag.BoolVar(&_config.DuckDbAllocatorBackgroundThreads, "duckdb-allocator-background-threads", boolFromEnvDefaultTrue(ENV_DUCKDB_ALLOCATOR_BACKGROUND_THREADS), "(Optional) Enable jemalloc background threads so freed memory is returned to the OS instead of retained indefinitely. Default: true; \"false\"/\"0\"/\"off\" restores DuckDB's default.")
+	flag.StringVar(&_config.DuckDbAllocatorFlushThreshold, "duckdb-allocator-flush-threshold", stringFromEnvOrDefault(ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD, DEFAULT_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD), "(Optional) DuckDB allocator_flush_threshold: flush the allocator after any task that peaked above this. Default: \""+DEFAULT_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD+"\". Set \"128MB\" to restore DuckDB's own default.")
+	flag.IntVar(&_config.DuckDbConnMaxLifetimeMinutes, "duckdb-conn-max-lifetime-minutes", intFromEnvOrDefault(ENV_DUCKDB_CONN_MAX_LIFETIME_MINUTES, DEFAULT_DUCKDB_CONN_MAX_LIFETIME_MINUTES), "(Optional) Recycle pooled DuckDB connections after N minutes (between uses, never mid-query); retained allocator memory is released when a connection closes. Default: 30. 0 disables recycling.")
 	flag.IntVar(&_config.ParquetRowGroupSizeMb, "parquet-row-group-size-mb", intFromEnv(ENV_PARQUET_ROW_GROUP_SIZE_MB), "(Optional) Parquet row group size in MB. Smaller values cap the in-memory write buffer. Default: 128")
 	flag.IntVar(&_config.ParquetPayloadThresholdMb, "parquet-payload-threshold-mb", intFromEnv(ENV_PARQUET_PAYLOAD_THRESHOLD_MB), "(Optional) Uncompressed payload (MB) per Parquet file before rolling to a new file. Default: 2048")
 	flag.StringVar(&_config.StoragePath, "storage-path", os.Getenv(ENV_STORAGE_PATH), "Path to the storage folder. Default: \""+DEFAULT_STORAGE_PATH+"\"")

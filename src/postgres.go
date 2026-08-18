@@ -130,16 +130,12 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			}
 
 			LogDebug(postgres.config, "Binding query", message.PreparedStatement)
-			previous := preparedStatement
-			messages, preparedStatement, err = queryHandler.HandleBindQuery(message, previous)
+			// Handlers return the input statement even on error, so ownership (and
+			// the deferred Close) is never lost to a nil overwrite.
+			messages, preparedStatement, err = queryHandler.HandleBindQuery(message, preparedStatement)
 			if err != nil {
 				postgres.writeError(err)
 				previousErr = err
-			}
-			if preparedStatement == nil {
-				// Handlers return nil on error; keep owning the live statement so the
-				// deferred Close still releases it (and any rows it already opened).
-				preparedStatement = previous
 			}
 			postgres.writeMessages(messages...)
 		case *pgproto3.Describe:
@@ -149,16 +145,10 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 
 			LogDebug(postgres.config, "Describing query", message.Name, "("+string(message.ObjectType)+")")
 			var messages []pgproto3.Message
-			previous := preparedStatement
-			messages, preparedStatement, err = queryHandler.HandleDescribeQuery(message, previous)
+			messages, preparedStatement, err = queryHandler.HandleDescribeQuery(message, preparedStatement)
 			if err != nil {
 				postgres.writeError(err)
 				previousErr = err
-			}
-			if preparedStatement == nil {
-				// Same as Bind: don't lose the live statement (or its open rows,
-				// stored before some error returns) on the error path.
-				preparedStatement = previous
 			}
 			postgres.writeMessages(messages...)
 		case *pgproto3.Execute:
@@ -179,10 +169,19 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			}
 
 			LogDebug(postgres.config, "Closing", string(message.ObjectType), message.Name)
-			// Client-requested release: rows and the statement itself (idempotent
-			// with the deferred Close). A later Describe/Execute on the closed
-			// statement gets an error from the guarded handlers, not a crash.
-			preparedStatement.Close()
+			// Postgres semantics: Close('S') releases the statement; Close('P')
+			// releases only the portal — the statement must stay bindable (JDBC
+			// cursor clients close portals mid-exchange and Bind again). Statement
+			// release is idempotent with the deferred Close; a later Describe/
+			// Execute on a closed statement gets an error from the guarded
+			// handlers, not a crash. (message.Name is ignored — pre-existing:
+			// BemiDB tracks a single statement per exchange.)
+			if message.ObjectType == 'S' {
+				preparedStatement.Close()
+			} else if preparedStatement.Rows != nil {
+				preparedStatement.Rows.Close()
+				preparedStatement.Rows = nil
+			}
 			postgres.writeMessages(&pgproto3.CloseComplete{})
 		case *pgproto3.Sync:
 			LogDebug(postgres.config, "Syncing query")
