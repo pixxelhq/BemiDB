@@ -180,6 +180,33 @@ func TestExtendedQueryStatementLifecycle(t *testing.T) {
 	terminateAndAwait(t, frontend, done)
 }
 
+// TestWireCloseUnknownNameIsNoOp pins the name check: pgjdbc statement-cache
+// evictions interleave Close('S', "old_name") into the current exchange —
+// closing a name that isn't the current statement must be a CloseComplete
+// no-op, not destroy the statement the client is actively using.
+func TestWireCloseUnknownNameIsNoOp(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+	frontend, done := startTestPostgresClient(t, queryHandler)
+
+	frontend.Send(&pgproto3.Parse{Name: "S_2", Query: "SELECT 1"})
+	frontend.Send(&pgproto3.Close{ObjectType: 'S', Name: "S_1"}) // evicting an older statement
+	frontend.Send(&pgproto3.Bind{PreparedStatement: "S_2"})
+	frontend.Send(&pgproto3.Describe{ObjectType: 'P'})
+	frontend.Send(&pgproto3.Execute{})
+	frontend.Send(&pgproto3.Sync{})
+	if err := frontend.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	sawRows, sawError := receiveUntilReady(t, frontend, "close unknown name")
+	if !sawRows || sawError {
+		t.Fatalf("expected S_2 to survive Close('S', \"S_1\"), got rows=%v error=%v", sawRows, sawError)
+	}
+
+	terminateAndAwait(t, frontend, done)
+}
+
 // TestWireClosePortalKeepsStatementBindable pins Postgres Close semantics:
 // Close('P') releases only the portal — the statement must remain bindable and
 // executable afterwards (JDBC cursor clients close portals mid-exchange and

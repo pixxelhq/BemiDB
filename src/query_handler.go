@@ -377,9 +377,8 @@ func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]p
 func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
 	// Bind creates a new portal: results from a previous Bind/Describe of this
 	// statement must not leak into it (a follow-up Execute would reuse them via
-	// the Rows != nil branch). This must run before every error return: on error
-	// the caller nils the statement, orphaning still-open rows beyond the reach
-	// of Sync's cleanup.
+	// the Rows != nil branch). Error returns hand the statement back to the
+	// caller, so anything still open stays reachable by the deferred Close.
 	if preparedStatement.Rows != nil {
 		preparedStatement.Rows.Close()
 		preparedStatement.Rows = nil

@@ -38,12 +38,11 @@ var DUCKDB_INIT_BOOT_QUERIES = []string{
 // recycles connections over time (SetConnMaxLifetime). Applied once at boot they
 // silently vanish on the first recycled connection — timezone flips to host-local,
 // the current schema reverts to main, multi-row scalar subqueries start erroring —
-// so they run in the driver's per-connection init hook instead. CREATE SCHEMA is
-// catalog-wide but sits here (idempotent) because USE public needs it to exist
-// before the boot queries have run on the very first connection.
+// so they run in the driver's per-connection init hook instead. These SETs are
+// deliberately fail-hard there: a session with the wrong timezone or subquery
+// semantics is worse than a failed connection. USE public is handled separately
+// in the hook (it needs the schema to exist; see connInitFn).
 var DUCKDB_SESSION_INIT_QUERIES = []string{
-	"CREATE SCHEMA IF NOT EXISTS public",
-	"USE public",
 	"SET scalar_subquery_error_on_multiple_rows=false",
 	"SET timezone='UTC'",
 }
@@ -52,6 +51,18 @@ type Duckdb struct {
 	db                                    *sql.DB
 	config                                *Config
 	stopImplicitAwsCredentialsRefreshChan chan struct{}
+}
+
+// readDuckdbSetting returns the engine's current value for a setting, or
+// "unavailable" — for confirmation logs that must report applied state, not
+// configured intent.
+func readDuckdbSetting(ctx context.Context, db *sql.DB, name string) string {
+	var value string
+	err := db.QueryRowContext(ctx, "SELECT value FROM duckdb_settings() WHERE name = '"+name+"'").Scan(&value)
+	if err != nil {
+		return "unavailable"
+	}
+	return value
 }
 
 func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
@@ -66,6 +77,18 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 		connInitFn = func(execer driver.ExecerContext) error {
 			for _, query := range DUCKDB_SESSION_INIT_QUERIES {
 				if _, err := execer.ExecContext(ctx, query, nil); err != nil {
+					return err
+				}
+			}
+			// USE public needs the schema to exist, which on the very first
+			// connection it doesn't. CREATE SCHEMA IF NOT EXISTS can still lose a
+			// concurrent write-write race (proven with 16 parallel fresh
+			// connections), so the create's error is ignored and the retried USE
+			// is the arbiter. After boot this stays a single always-succeeding
+			// statement per connection.
+			if _, err := execer.ExecContext(ctx, "USE public", nil); err != nil {
+				_, _ = execer.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS public", nil)
+				if _, err := execer.ExecContext(ctx, "USE public", nil); err != nil {
 					return err
 				}
 			}
@@ -90,9 +113,8 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 		stopImplicitAwsCredentialsRefreshChan: make(chan struct{}),
 	}
 
-	bootQueries := []string{}
 	if withPgCompatibility {
-		bootQueries = slices.Concat(
+		bootQueries := slices.Concat(
 			// Set up DuckDB
 			DUCKDB_INIT_BOOT_QUERIES,
 
@@ -104,9 +126,7 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 			CreatePgCatalogTableQueries(config),
 			CreateInformationSchemaTableQueries(config),
 		)
-	}
 
-	if withPgCompatibility {
 		// Pin a single pooled connection for the boot sequence. The pg-compat
 		// macros/views below are created unqualified and must land in main, where
 		// they have always lived (USE public used to run only after them; session
@@ -118,6 +138,7 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 		_, err = conn.ExecContext(ctx, "USE main")
 		PanicIfError(config, err)
 		for _, query := range bootQueries {
+			LogDebug(config, "Querying DuckDB:", query)
 			_, err := conn.ExecContext(ctx, query)
 			PanicIfError(config, err)
 		}
@@ -146,7 +167,10 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 			LogError(config, "DuckDB: failed to set allocator_flush_threshold:", err)
 		}
 	}
-	LogInfo(config, "DuckDB: allocator background_threads:", config.DuckDbAllocatorBackgroundThreads, "flush_threshold:", config.DuckDbAllocatorFlushThreshold)
+	// Log the values the engine actually holds, not the configured intent — a
+	// rejected SET above must not produce an INFO line claiming it was applied.
+	LogInfo(config, "DuckDB: allocator background_threads:", readDuckdbSetting(ctx, db, "allocator_background_threads"),
+		"flush_threshold:", readDuckdbSetting(ctx, db, "allocator_flush_threshold"))
 
 	// Point DuckDB at a temp directory so larger-than-memory operations (joins,
 	// aggregates, sorts, and the sync merge) spill to disk instead of erroring.

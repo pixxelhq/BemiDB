@@ -171,14 +171,18 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			LogDebug(postgres.config, "Closing", string(message.ObjectType), message.Name)
 			// Postgres semantics: Close('S') releases the statement; Close('P')
 			// releases only the portal — the statement must stay bindable (JDBC
-			// cursor clients close portals mid-exchange and Bind again). Statement
-			// release is idempotent with the deferred Close; a later Describe/
-			// Execute on a closed statement gets an error from the guarded
-			// handlers, not a crash. (message.Name is ignored — pre-existing:
-			// BemiDB tracks a single statement per exchange.)
+			// cursor clients close portals mid-exchange and Bind again). Closing a
+			// name that isn't the current one is a no-op answered with
+			// CloseComplete, like Postgres closing an unknown statement — pgjdbc
+			// statement-cache evictions interleave closes of OLD statements into
+			// the current exchange. Statement release is idempotent with the
+			// deferred Close; a later Describe/Execute on a closed statement gets
+			// an error from the guarded handlers, not a crash.
 			if message.ObjectType == 'S' {
-				preparedStatement.Close()
-			} else if preparedStatement.Rows != nil {
+				if message.Name == preparedStatement.Name {
+					preparedStatement.Close()
+				}
+			} else if message.Name == preparedStatement.Portal && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
 				preparedStatement.Rows = nil
 			}
@@ -188,8 +192,9 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			// Sync must always respond, even after an error. Release rows left open
 			// by a Describe never followed by Execute: this Sync may not exit the
 			// exchange (psycopg sends Parse->Sync->Bind->...), so rows can't wait
-			// for the deferred Close. The nil guard is defense-in-depth — error
-			// paths now restore the previous statement instead of nilling it.
+			// for the deferred Close. Handlers return the statement even on error,
+			// so it can't be nil here — the guard only protects against a future
+			// handler regressing that contract.
 			if preparedStatement != nil && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
 				preparedStatement.Rows = nil

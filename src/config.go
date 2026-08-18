@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -39,15 +40,20 @@ func stringFromEnvOrDefault(key string, defaultValue string) string {
 }
 
 // boolFromEnvDefaultTrue is for flags that default to on: unset/empty is true,
-// and disabling requires an explicit "false"/"0"/"off" (any case) — so that
-// e.g. FALSE or 0 don't silently leave the feature enabled.
+// and disabling requires an explicit negative — any case, surrounding
+// whitespace ignored (k8s configmaps and .env files produce "false " and
+// "off\n" easily, and a silently-still-enabled feature is the exact footgun
+// this helper exists to prevent).
 func boolFromEnvDefaultTrue(key string) bool {
-	switch strings.ToLower(os.Getenv(key)) {
-	case "false", "0", "off":
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "false", "0", "off", "no", "disable", "disabled":
 		return false
 	}
 	return true
 }
+
+// duckdbMemorySizeRegexp matches DuckDB memory sizes ("64MB", "1.5 GiB").
+var duckdbMemorySizeRegexp = regexp.MustCompile(`(?i)^\s*\d+(\.\d+)?\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)?\s*$`)
 
 const (
 	VERSION = "0.51.1"
@@ -223,6 +229,13 @@ func parseFlags() {
 	// operator believes they are protected.
 	if _config.MaxResultMb < 0 {
 		panic("--max-result-mb (BEMIDB_MAX_RESULT_MB) must be >= 0, got " + IntToString(_config.MaxResultMb))
+	}
+
+	// Fail fast on a malformed memory size: the SET it feeds is fail-soft
+	// (engine rejection must not crash boot), so a typo like "64XB" would
+	// otherwise boot "successfully" with the OOM mitigation silently absent.
+	if _config.DuckDbAllocatorFlushThreshold != "" && !duckdbMemorySizeRegexp.MatchString(_config.DuckDbAllocatorFlushThreshold) {
+		panic("--duckdb-allocator-flush-threshold (" + ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD + ") must be a memory size like \"64MB\", got " + _config.DuckDbAllocatorFlushThreshold)
 	}
 
 	if _config.Host == "" {
