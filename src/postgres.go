@@ -110,6 +110,12 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 	}
 	postgres.writeMessages(messages...)
 
+	// Release the statement's DuckDB-side plan on every exit from this exchange —
+	// the Sync return, a dead connection, or a panic. Statements were previously
+	// never closed anywhere (database/sql requires Stmt.Close), leaking each bound
+	// plan into DuckDB's C++ memory for the life of the pooled connection.
+	defer func() { preparedStatement.Close() }()
+
 	var previousErr error
 	for {
 		message, err := postgres.backend.Receive()
@@ -124,10 +130,16 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			}
 
 			LogDebug(postgres.config, "Binding query", message.PreparedStatement)
-			messages, preparedStatement, err = queryHandler.HandleBindQuery(message, preparedStatement)
+			previous := preparedStatement
+			messages, preparedStatement, err = queryHandler.HandleBindQuery(message, previous)
 			if err != nil {
 				postgres.writeError(err)
 				previousErr = err
+			}
+			if preparedStatement == nil {
+				// Handlers return nil on error; keep owning the live statement so the
+				// deferred Close still releases it (and any rows it already opened).
+				preparedStatement = previous
 			}
 			postgres.writeMessages(messages...)
 		case *pgproto3.Describe:
@@ -137,10 +149,16 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 
 			LogDebug(postgres.config, "Describing query", message.Name, "("+string(message.ObjectType)+")")
 			var messages []pgproto3.Message
-			messages, preparedStatement, err = queryHandler.HandleDescribeQuery(message, preparedStatement)
+			previous := preparedStatement
+			messages, preparedStatement, err = queryHandler.HandleDescribeQuery(message, previous)
 			if err != nil {
 				postgres.writeError(err)
 				previousErr = err
+			}
+			if preparedStatement == nil {
+				// Same as Bind: don't lose the live statement (or its open rows,
+				// stored before some error returns) on the error path.
+				preparedStatement = previous
 			}
 			postgres.writeMessages(messages...)
 		case *pgproto3.Execute:
@@ -161,18 +179,21 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			}
 
 			LogDebug(postgres.config, "Closing", string(message.ObjectType), message.Name)
-			if preparedStatement.Rows != nil {
-				preparedStatement.Rows.Close()
-			}
+			// Client-requested release: rows and the statement itself (idempotent
+			// with the deferred Close). A later Describe/Execute on the closed
+			// statement gets an error from the guarded handlers, not a crash.
+			preparedStatement.Close()
 			postgres.writeMessages(&pgproto3.CloseComplete{})
 		case *pgproto3.Sync:
 			LogDebug(postgres.config, "Syncing query")
-			// Sync must always respond, so unlike the guarded cases above it runs
-			// even after an error — when a Bind/Describe failure has left
-			// preparedStatement nil. Guard the pointer, then release rows left open
-			// by a Describe that was never followed by Execute (Close is idempotent).
+			// Sync must always respond, even after an error. Release rows left open
+			// by a Describe never followed by Execute: this Sync may not exit the
+			// exchange (psycopg sends Parse->Sync->Bind->...), so rows can't wait
+			// for the deferred Close. The nil guard is defense-in-depth — error
+			// paths now restore the previous statement instead of nilling it.
 			if preparedStatement != nil && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
+				preparedStatement.Rows = nil
 			}
 			postgres.writeMessages(
 				&pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE},

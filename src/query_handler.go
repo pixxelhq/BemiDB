@@ -52,6 +52,27 @@ type PreparedStatement struct {
 	Rows *sql.Rows
 }
 
+// Close releases the driver-side resources this statement pins. database/sql
+// requires it ("The caller must call the statement's Close method when the
+// statement is no longer needed"), and go-duckdb has no finalizer: an unclosed
+// statement keeps its bound plan alive in DuckDB's C++ memory — invisible to
+// both the Go heap and duckdb_memory() — for the life of its pooled connection.
+// Rows close first so the driver doesn't defer the statement close behind an
+// open result. Nil-safe and idempotent.
+func (preparedStatement *PreparedStatement) Close() {
+	if preparedStatement == nil {
+		return
+	}
+	if preparedStatement.Rows != nil {
+		preparedStatement.Rows.Close()
+		preparedStatement.Rows = nil
+	}
+	if preparedStatement.Statement != nil {
+		preparedStatement.Statement.Close()
+		preparedStatement.Statement = nil
+	}
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 type NullDecimal struct {
@@ -469,6 +490,9 @@ func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe
 	if preparedStatement.Query == "" || !preparedStatement.Bound { // Empty query or Parse->[No Bind]->Describe
 		return []pgproto3.Message{&pgproto3.NoData{}}, preparedStatement, nil
 	}
+	if preparedStatement.Statement == nil { // Statement released by a wire-protocol Close
+		return nil, nil, fmt.Errorf("prepared statement was already closed: %s", preparedStatement.OriginalQuery)
+	}
 
 	rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
 	if err != nil {
@@ -493,6 +517,9 @@ func (queryHandler *QueryHandler) HandleExecuteQuery(message *pgproto3.Execute, 
 	}
 
 	if preparedStatement.Rows == nil { // Parse->[No Bind]->Describe->Execute or Parse->Bind->[No Describe]->Execute
+		if preparedStatement.Statement == nil { // Statement released by a wire-protocol Close
+			return nil, fmt.Errorf("prepared statement was already closed: %s", preparedStatement.OriginalQuery)
+		}
 		rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
 		if err != nil {
 			return nil, err

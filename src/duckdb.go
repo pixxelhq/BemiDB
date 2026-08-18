@@ -46,6 +46,14 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 	db, err := sql.Open("duckdb", "")
 	PanicIfError(config, err)
 
+	// Recycle pooled DuckDB connections periodically. Measured on this engine:
+	// jemalloc's retained (freed-but-held) memory pins to long-lived connections
+	// and is only returned to the OS when they close. database/sql rotates a
+	// connection strictly between uses — never mid-query, invisible to clients.
+	if config.DuckDbConnMaxLifetimeMinutes > 0 {
+		db.SetConnMaxLifetime(time.Duration(config.DuckDbConnMaxLifetimeMinutes) * time.Minute)
+	}
+
 	duckdb := &Duckdb{
 		db:                                    db,
 		config:                                config,
@@ -74,6 +82,24 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 	for _, query := range bootQueries {
 		_, err := duckdb.ExecContext(ctx, query, nil)
 		PanicIfError(config, err)
+	}
+
+	// Return freed memory to the OS. DuckDB's bundled jemalloc retains freed
+	// allocations indefinitely by default — the right trade for an embedded
+	// notebook, but on a long-lived server the retained pages accumulate with
+	// every heavy query until the kernel OOM-kills the pod (measured: a scan
+	// workload held 1.2GiB at idle with the defaults, 73MiB with these two).
+	// Background threads purge asynchronously; the lower flush threshold
+	// (default 128MB) extends the post-task flush to mid-size queries.
+	// Accepted as no-ops by builds without jemalloc (e.g. macOS).
+	if config.DuckDbAllocatorBackgroundThreads {
+		_, err := duckdb.ExecContext(ctx, "SET allocator_background_threads=true", nil)
+		PanicIfError(config, err)
+	}
+	if config.DuckDbAllocatorFlushThreshold != "" {
+		_, err := duckdb.ExecContext(ctx, "SET allocator_flush_threshold='"+config.DuckDbAllocatorFlushThreshold+"'", nil)
+		PanicIfError(config, err)
+		LogInfo(config, "DuckDB: allocator background_threads:", config.DuckDbAllocatorBackgroundThreads, "flush_threshold:", config.DuckDbAllocatorFlushThreshold)
 	}
 
 	// Point DuckDB at a temp directory so larger-than-memory operations (joins,

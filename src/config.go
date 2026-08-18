@@ -24,6 +24,20 @@ func intFromEnv(key string) int {
 	return v
 }
 
+func intFromEnvOrDefault(key string, defaultValue int) int {
+	if os.Getenv(key) == "" {
+		return defaultValue
+	}
+	return intFromEnv(key)
+}
+
+func stringFromEnvOrDefault(key string, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
 const (
 	VERSION = "0.51.1"
 
@@ -57,10 +71,13 @@ const (
 	ENV_METRICS_PORT          = "BEMIDB_METRICS_PORT"
 	ENV_MEMORY_SAMPLE_SECONDS = "BEMIDB_MEMORY_SAMPLE_SECONDS"
 
-	ENV_DUCKDB_MEMORY_LIMIT   = "BEMIDB_DUCKDB_MEMORY_LIMIT"
-	ENV_DUCKDB_TEMP_DIRECTORY = "BEMIDB_DUCKDB_TEMP_DIRECTORY"
-	ENV_DUCKDB_THREADS        = "BEMIDB_DUCKDB_THREADS"
-	ENV_MAX_RESULT_MB         = "BEMIDB_MAX_RESULT_MB"
+	ENV_DUCKDB_MEMORY_LIMIT                 = "BEMIDB_DUCKDB_MEMORY_LIMIT"
+	ENV_DUCKDB_TEMP_DIRECTORY               = "BEMIDB_DUCKDB_TEMP_DIRECTORY"
+	ENV_DUCKDB_THREADS                      = "BEMIDB_DUCKDB_THREADS"
+	ENV_MAX_RESULT_MB                       = "BEMIDB_MAX_RESULT_MB"
+	ENV_DUCKDB_ALLOCATOR_BACKGROUND_THREADS = "BEMIDB_DUCKDB_ALLOCATOR_BACKGROUND_THREADS"
+	ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD    = "BEMIDB_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD"
+	ENV_DUCKDB_CONN_MAX_LIFETIME_MINUTES    = "BEMIDB_DUCKDB_CONN_MAX_LIFETIME_MINUTES"
 
 	ENV_PARQUET_ROW_GROUP_SIZE_MB    = "BEMIDB_PARQUET_ROW_GROUP_SIZE_MB"
 	ENV_PARQUET_PAYLOAD_THRESHOLD_MB = "BEMIDB_PARQUET_PAYLOAD_THRESHOLD_MB"
@@ -106,28 +123,31 @@ type PgConfig struct {
 }
 
 type Config struct {
-	Host                      string
-	Port                      string
-	Database                  string
-	User                      string
-	EncryptedPassword         string
-	EnableCache               bool
-	EnableHttpConnectionCache bool
-	EnablePprof               bool
-	MetricsPort               string
-	MemorySampleSeconds       int
-	DuckDbMemoryLimit         string
-	DuckDbTempDirectory       string
-	DuckDbThreads             int
-	MaxResultMb               int
-	ParquetRowGroupSizeMb     int
-	ParquetPayloadThresholdMb int
-	LogLevel                  string
-	StorageType               string
-	StoragePath               string
-	Aws                       AwsConfig
-	Pg                        PgConfig
-	DisableAnonymousAnalytics bool
+	Host                             string
+	Port                             string
+	Database                         string
+	User                             string
+	EncryptedPassword                string
+	EnableCache                      bool
+	EnableHttpConnectionCache        bool
+	EnablePprof                      bool
+	MetricsPort                      string
+	MemorySampleSeconds              int
+	DuckDbMemoryLimit                string
+	DuckDbTempDirectory              string
+	DuckDbThreads                    int
+	MaxResultMb                      int
+	DuckDbAllocatorBackgroundThreads bool
+	DuckDbAllocatorFlushThreshold    string
+	DuckDbConnMaxLifetimeMinutes     int
+	ParquetRowGroupSizeMb            int
+	ParquetPayloadThresholdMb        int
+	LogLevel                         string
+	StorageType                      string
+	StoragePath                      string
+	Aws                              AwsConfig
+	Pg                               PgConfig
+	DisableAnonymousAnalytics        bool
 }
 
 type configParseValues struct {
@@ -159,6 +179,9 @@ func registerFlags() {
 	flag.StringVar(&_config.DuckDbTempDirectory, "duckdb-temp-directory", os.Getenv(ENV_DUCKDB_TEMP_DIRECTORY), "(Optional) DuckDB temp_directory for spilling to disk. Defaults to the OS temp dir so a memory limit can spill instead of erroring.")
 	flag.IntVar(&_config.DuckDbThreads, "duckdb-threads", intFromEnv(ENV_DUCKDB_THREADS), "(Optional) DuckDB threads. Caps scan parallelism to bound peak memory. Defaults to DuckDB's own default (all host cores).")
 	flag.IntVar(&_config.MaxResultMb, "max-result-mb", intFromEnv(ENV_MAX_RESULT_MB), "(Optional) Maximum result payload in MB per query. Results are buffered in memory before sending, so unbounded results can OOM the process. 0 disables the cap.")
+	flag.BoolVar(&_config.DuckDbAllocatorBackgroundThreads, "duckdb-allocator-background-threads", os.Getenv(ENV_DUCKDB_ALLOCATOR_BACKGROUND_THREADS) != "false", "(Optional) Enable jemalloc background threads so freed memory is returned to the OS instead of retained indefinitely. Default: true; set to false to restore DuckDB's default.")
+	flag.StringVar(&_config.DuckDbAllocatorFlushThreshold, "duckdb-allocator-flush-threshold", stringFromEnvOrDefault(ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD, "64MB"), "(Optional) DuckDB allocator_flush_threshold: flush the allocator after any task that peaked above this. Default: \"64MB\" (DuckDB's own default is 128MB). Empty leaves DuckDB's default.")
+	flag.IntVar(&_config.DuckDbConnMaxLifetimeMinutes, "duckdb-conn-max-lifetime-minutes", intFromEnvOrDefault(ENV_DUCKDB_CONN_MAX_LIFETIME_MINUTES, 30), "(Optional) Recycle pooled DuckDB connections after N minutes (between uses, never mid-query); retained allocator memory is released when a connection closes. Default: 30. 0 disables recycling.")
 	flag.IntVar(&_config.ParquetRowGroupSizeMb, "parquet-row-group-size-mb", intFromEnv(ENV_PARQUET_ROW_GROUP_SIZE_MB), "(Optional) Parquet row group size in MB. Smaller values cap the in-memory write buffer. Default: 128")
 	flag.IntVar(&_config.ParquetPayloadThresholdMb, "parquet-payload-threshold-mb", intFromEnv(ENV_PARQUET_PAYLOAD_THRESHOLD_MB), "(Optional) Uncompressed payload (MB) per Parquet file before rolling to a new file. Default: 2048")
 	flag.StringVar(&_config.StoragePath, "storage-path", os.Getenv(ENV_STORAGE_PATH), "Path to the storage folder. Default: \""+DEFAULT_STORAGE_PATH+"\"")
