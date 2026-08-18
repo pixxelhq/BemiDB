@@ -30,11 +30,12 @@ var DUCKDB_INIT_BOOT_QUERIES = []string{
 	"INSTALL spatial",
 	"LOAD spatial",
 
-	// Preload ICU: the session hook's SET timezone would otherwise autoload it,
-	// and concurrent fresh connections racing that autoload poison the instance
-	// permanently ("icu_sort_key already exists"). Loading it here, on the
-	// single pinned boot connection, makes the hook autoload-free by design
-	// rather than shielded by boot ordering.
+	// Preload ICU: the session hook's SET timezone autoloads it, and concurrent
+	// fresh connections racing that autoload poison the instance permanently
+	// ("icu_sort_key already exists"). Note the boot connection's own hook still
+	// autoloads ICU (hooks run before this list) — that is safe only because
+	// boot is single-threaded and completes before the server accepts clients;
+	// every connection after boot finds ICU loaded and autoloads nothing.
 	"INSTALL icu",
 	"LOAD icu",
 

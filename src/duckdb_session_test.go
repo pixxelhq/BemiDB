@@ -75,32 +75,42 @@ func TestSessionInitHookConvergesUnderConcurrentFreshConnections(t *testing.T) {
 	db := sql.OpenDB(connector)
 	defer db.Close()
 
+	// A start gate releases all goroutines at once, and no connection is closed
+	// until every acquisition finished — the pool can't serve a reused
+	// connection, so all 16 hooks run concurrently on a schema-less catalog
+	// every time (without the gate the race is only hit probabilistically).
+	startGate := make(chan struct{})
 	var wg sync.WaitGroup
+	acquired := make(chan *sql.Conn, 16)
 	errs := make(chan error, 16)
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			conn, err := db.Conn(ctx) // overlapping Conn calls force fresh physical connections
+			<-startGate
+			conn, err := db.Conn(ctx)
 			if err != nil {
 				errs <- fmt.Errorf("connection creation failed (hook error): %w", err)
 				return
 			}
-			defer conn.Close()
-			var schema string
-			if err := conn.QueryRowContext(ctx, "SELECT current_schema()").Scan(&schema); err != nil {
-				errs <- err
-				return
-			}
-			if schema != "public" {
-				errs <- fmt.Errorf("expected schema public, got %q", schema)
-			}
+			acquired <- conn
 		}()
 	}
+	close(startGate)
 	wg.Wait()
+	close(acquired)
 	close(errs)
 	for err := range errs {
 		t.Errorf("concurrent fresh connection: %v", err)
+	}
+	for conn := range acquired {
+		var schema string
+		if err := conn.QueryRowContext(ctx, "SELECT current_schema()").Scan(&schema); err != nil {
+			t.Errorf("current_schema on initialized connection: %v", err)
+		} else if schema != "public" {
+			t.Errorf("expected schema public, got %q", schema)
+		}
+		conn.Close()
 	}
 }
 
@@ -118,8 +128,12 @@ func TestDuckdbMemorySizeRegexpMatchesEngine(t *testing.T) {
 	defer duckdb.Close()
 	ctx := context.Background()
 
-	engineAccepts := func(value string) bool {
-		_, err := duckdb.ExecContext(ctx, "SET allocator_flush_threshold='"+value+"'", nil)
+	// The guard fronts both settings, so agreement is checked against both —
+	// their grammars are identical today, but only the engine can promise that
+	// across an upgrade (e.g. memory_limit gaining percentage support).
+	settings := []string{"allocator_flush_threshold", "memory_limit"}
+	engineAccepts := func(setting, value string) bool {
+		_, err := duckdb.ExecContext(ctx, "SET "+setting+"='"+value+"'", nil)
 		return err == nil
 	}
 
@@ -128,8 +142,10 @@ func TestDuckdbMemorySizeRegexpMatchesEngine(t *testing.T) {
 		"64MB", "64M", "64 MB", " 64MB ", "1G", "1GiB", "1.5GB", "1kb", "0MB", "64B", "2KiB", "1TB", "1TiB", "-1",
 		"1PiB", "1P", "64", "64XB", "80%", "MB", "1.5", "--1", "64 X B",
 	} {
-		if duckdbMemorySizeRegexp.MatchString(value) && !engineAccepts(value) {
-			t.Errorf("guard accepts %q but the engine rejects it — the fail-soft SET would silently no-op; tighten duckdbMemorySizeRegexp", value)
+		for _, setting := range settings {
+			if duckdbMemorySizeRegexp.MatchString(value) && !engineAccepts(setting, value) {
+				t.Errorf("guard accepts %q but the engine rejects it for %s — the SET would fail; tighten duckdbMemorySizeRegexp", value, setting)
+			}
 		}
 	}
 
@@ -138,8 +154,10 @@ func TestDuckdbMemorySizeRegexpMatchesEngine(t *testing.T) {
 		if !duckdbMemorySizeRegexp.MatchString(value) {
 			t.Errorf("guard rejects legal value %q — boot would panic on good config; loosen duckdbMemorySizeRegexp", value)
 		}
-		if !engineAccepts(value) {
-			t.Errorf("engine no longer accepts %q — update the canonical list and the regexp together", value)
+		for _, setting := range settings {
+			if !engineAccepts(setting, value) {
+				t.Errorf("engine no longer accepts %q for %s — update the canonical list and the regexp together", value, setting)
+			}
 		}
 	}
 }
