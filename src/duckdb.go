@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"io"
 	"regexp"
 	"slices"
@@ -28,6 +29,14 @@ var DUCKDB_INIT_BOOT_QUERIES = []string{
 
 	"INSTALL spatial",
 	"LOAD spatial",
+
+	// Preload ICU: the session hook's SET timezone would otherwise autoload it,
+	// and concurrent fresh connections racing that autoload poison the instance
+	// permanently ("icu_sort_key already exists"). Loading it here, on the
+	// single pinned boot connection, makes the hook autoload-free by design
+	// rather than shielded by boot ordering.
+	"INSTALL icu",
+	"LOAD icu",
 
 	// Set up schemas
 	"SELECT oid FROM pg_catalog.pg_namespace",
@@ -53,13 +62,40 @@ type Duckdb struct {
 	stopImplicitAwsCredentialsRefreshChan chan struct{}
 }
 
+// duckdbSessionInitFn builds the connector init hook applied to every new
+// pooled connection: the session-scoped queries, then USE public. USE needs
+// the schema to exist, which on the very first connection it doesn't; CREATE
+// SCHEMA IF NOT EXISTS can still lose a concurrent write-write race (proven
+// with 16 parallel fresh connections), so the create's error is only reported,
+// and the retried USE is the arbiter — losers of the race converge on it.
+// After boot this stays a single always-succeeding USE per connection.
+func duckdbSessionInitFn(ctx context.Context, sessionQueries []string) func(execer driver.ExecerContext) error {
+	return func(execer driver.ExecerContext) error {
+		for _, query := range sessionQueries {
+			if _, err := execer.ExecContext(ctx, query, nil); err != nil {
+				return err
+			}
+		}
+		if _, err := execer.ExecContext(ctx, "USE public", nil); err != nil {
+			_, createErr := execer.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS public", nil)
+			if _, err := execer.ExecContext(ctx, "USE public", nil); err != nil {
+				// Keep the create's error: when the failure isn't the benign
+				// race (disk full, catalog corruption), it is the root cause.
+				return fmt.Errorf("USE public failed after CREATE SCHEMA attempt: %w (create error: %v)", err, createErr)
+			}
+		}
+		return nil
+	}
+}
+
 // readDuckdbSetting returns the engine's current value for a setting, or
 // "unavailable" — for confirmation logs that must report applied state, not
 // configured intent.
-func readDuckdbSetting(ctx context.Context, db *sql.DB, name string) string {
+func readDuckdbSetting(ctx context.Context, config *Config, db *sql.DB, name string) string {
+	query := "SELECT value FROM duckdb_settings() WHERE name = '" + name + "'"
+	LogDebug(config, "Querying DuckDB:", query)
 	var value string
-	err := db.QueryRowContext(ctx, "SELECT value FROM duckdb_settings() WHERE name = '"+name+"'").Scan(&value)
-	if err != nil {
+	if err := db.QueryRowContext(ctx, query).Scan(&value); err != nil {
 		return "unavailable"
 	}
 	return value
@@ -74,26 +110,7 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 	// they never ran session setup, so their hook stays nil.
 	var connInitFn func(execer driver.ExecerContext) error
 	if withPgCompatibility {
-		connInitFn = func(execer driver.ExecerContext) error {
-			for _, query := range DUCKDB_SESSION_INIT_QUERIES {
-				if _, err := execer.ExecContext(ctx, query, nil); err != nil {
-					return err
-				}
-			}
-			// USE public needs the schema to exist, which on the very first
-			// connection it doesn't. CREATE SCHEMA IF NOT EXISTS can still lose a
-			// concurrent write-write race (proven with 16 parallel fresh
-			// connections), so the create's error is ignored and the retried USE
-			// is the arbiter. After boot this stays a single always-succeeding
-			// statement per connection.
-			if _, err := execer.ExecContext(ctx, "USE public", nil); err != nil {
-				_, _ = execer.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS public", nil)
-				if _, err := execer.ExecContext(ctx, "USE public", nil); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
+		connInitFn = duckdbSessionInitFn(ctx, DUCKDB_SESSION_INIT_QUERIES)
 	}
 	connector, err := duckDb.NewConnector("", connInitFn)
 	PanicIfError(config, err)
@@ -169,8 +186,8 @@ func NewDuckdb(config *Config, withPgCompatibility bool) *Duckdb {
 	}
 	// Log the values the engine actually holds, not the configured intent — a
 	// rejected SET above must not produce an INFO line claiming it was applied.
-	LogInfo(config, "DuckDB: allocator background_threads:", readDuckdbSetting(ctx, db, "allocator_background_threads"),
-		"flush_threshold:", readDuckdbSetting(ctx, db, "allocator_flush_threshold"))
+	LogInfo(config, "DuckDB: allocator background_threads:", readDuckdbSetting(ctx, config, db, "allocator_background_threads"),
+		"flush_threshold:", readDuckdbSetting(ctx, config, db, "allocator_flush_threshold"))
 
 	// Point DuckDB at a temp directory so larger-than-memory operations (joins,
 	// aggregates, sorts, and the sync merge) spill to disk instead of erroring.

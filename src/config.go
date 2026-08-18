@@ -52,8 +52,12 @@ func boolFromEnvDefaultTrue(key string) bool {
 	return true
 }
 
-// duckdbMemorySizeRegexp matches DuckDB memory sizes ("64MB", "1.5 GiB").
-var duckdbMemorySizeRegexp = regexp.MustCompile(`(?i)^\s*\d+(\.\d+)?\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)?\s*$`)
+// duckdbMemorySizeRegexp matches exactly what DuckDB 1.1.3's own parser accepts
+// for memory sizes, measured against the engine (see the engine-agreement test):
+// a unit is required ("64" is rejected), single-letter units are legal ("64M",
+// "1G"), P* units are NOT accepted, and "-1" (unlimited) is. Kept in lockstep
+// with the engine by TestDuckdbMemorySizeRegexpMatchesEngine.
+var duckdbMemorySizeRegexp = regexp.MustCompile(`(?i)^\s*(-1|\d+(\.\d+)?\s*(B|[KMGT](IB|B)?))\s*$`)
 
 const (
 	VERSION = "0.51.1"
@@ -199,7 +203,7 @@ func registerFlags() {
 	flag.StringVar(&_config.DuckDbTempDirectory, "duckdb-temp-directory", os.Getenv(ENV_DUCKDB_TEMP_DIRECTORY), "(Optional) DuckDB temp_directory for spilling to disk. Defaults to the OS temp dir so a memory limit can spill instead of erroring.")
 	flag.IntVar(&_config.DuckDbThreads, "duckdb-threads", intFromEnv(ENV_DUCKDB_THREADS), "(Optional) DuckDB threads. Caps scan parallelism to bound peak memory. Defaults to DuckDB's own default (all host cores).")
 	flag.IntVar(&_config.MaxResultMb, "max-result-mb", intFromEnv(ENV_MAX_RESULT_MB), "(Optional) Maximum result payload in MB per query. Results are buffered in memory before sending, so unbounded results can OOM the process. 0 disables the cap.")
-	flag.BoolVar(&_config.DuckDbAllocatorBackgroundThreads, "duckdb-allocator-background-threads", boolFromEnvDefaultTrue(ENV_DUCKDB_ALLOCATOR_BACKGROUND_THREADS), "(Optional) Enable jemalloc background threads so freed memory is returned to the OS instead of retained indefinitely. Default: true; \"false\"/\"0\"/\"off\" restores DuckDB's default.")
+	flag.BoolVar(&_config.DuckDbAllocatorBackgroundThreads, "duckdb-allocator-background-threads", boolFromEnvDefaultTrue(ENV_DUCKDB_ALLOCATOR_BACKGROUND_THREADS), "(Optional) Enable jemalloc background threads so freed memory is returned to the OS instead of retained indefinitely. Default: true; \"false\"/\"0\"/\"off\"/\"no\"/\"disable(d)\" (any case, whitespace ignored) restores DuckDB's default.")
 	flag.StringVar(&_config.DuckDbAllocatorFlushThreshold, "duckdb-allocator-flush-threshold", stringFromEnvOrDefault(ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD, DEFAULT_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD), "(Optional) DuckDB allocator_flush_threshold: flush the allocator after any task that peaked above this. Default: \""+DEFAULT_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD+"\". Set \"128MB\" to restore DuckDB's own default.")
 	flag.IntVar(&_config.DuckDbConnMaxLifetimeMinutes, "duckdb-conn-max-lifetime-minutes", intFromEnvOrDefault(ENV_DUCKDB_CONN_MAX_LIFETIME_MINUTES, DEFAULT_DUCKDB_CONN_MAX_LIFETIME_MINUTES), "(Optional) Recycle pooled DuckDB connections after N minutes (between uses, never mid-query); retained allocator memory is released when a connection closes. Default: 30. 0 disables recycling.")
 	flag.IntVar(&_config.ParquetRowGroupSizeMb, "parquet-row-group-size-mb", intFromEnv(ENV_PARQUET_ROW_GROUP_SIZE_MB), "(Optional) Parquet row group size in MB. Smaller values cap the in-memory write buffer. Default: 128")
@@ -236,6 +240,12 @@ func parseFlags() {
 	// otherwise boot "successfully" with the OOM mitigation silently absent.
 	if _config.DuckDbAllocatorFlushThreshold != "" && !duckdbMemorySizeRegexp.MatchString(_config.DuckDbAllocatorFlushThreshold) {
 		panic("--duckdb-allocator-flush-threshold (" + ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD + ") must be a memory size like \"64MB\", got " + _config.DuckDbAllocatorFlushThreshold)
+	}
+	// Same validation for the OOM-critical memory limit: its SET is fail-hard at
+	// boot, so catching the malformed value here names the flag instead of
+	// surfacing a raw engine error mid-startup.
+	if _config.DuckDbMemoryLimit != "" && !duckdbMemorySizeRegexp.MatchString(_config.DuckDbMemoryLimit) {
+		panic("--duckdb-memory-limit (" + ENV_DUCKDB_MEMORY_LIMIT + ") must be a memory size like \"4GB\", got " + _config.DuckDbMemoryLimit)
 	}
 
 	if _config.Host == "" {
