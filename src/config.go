@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,6 +24,40 @@ func intFromEnv(key string) int {
 	}
 	return v
 }
+
+func intFromEnvOrDefault(key string, defaultValue int) int {
+	if os.Getenv(key) == "" {
+		return defaultValue
+	}
+	return intFromEnv(key)
+}
+
+func stringFromEnvOrDefault(key string, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// boolFromEnvDefaultTrue is for flags that default to on: unset/empty is true,
+// and disabling requires an explicit negative — any case, surrounding
+// whitespace ignored (k8s configmaps and .env files produce "false " and
+// "off\n" easily, and a silently-still-enabled feature is the exact footgun
+// this helper exists to prevent).
+func boolFromEnvDefaultTrue(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "false", "0", "off", "no", "disable", "disabled":
+		return false
+	}
+	return true
+}
+
+// duckdbMemorySizeRegexp matches exactly what DuckDB 1.1.3's own parser accepts
+// for memory sizes, measured against the engine (see the engine-agreement test):
+// a unit is required ("64" is rejected), single-letter units are legal ("64M",
+// "1G"), P* units are NOT accepted, and "-1" (unlimited) is. Kept in lockstep
+// with the engine by TestDuckdbMemorySizeRegexpMatchesEngine.
+var duckdbMemorySizeRegexp = regexp.MustCompile(`(?i)^\s*(-1|\d+(\.\d+)?\s*(B|[KMGT](IB|B)?))\s*$`)
 
 const (
 	VERSION = "0.51.1"
@@ -57,10 +92,13 @@ const (
 	ENV_METRICS_PORT          = "BEMIDB_METRICS_PORT"
 	ENV_MEMORY_SAMPLE_SECONDS = "BEMIDB_MEMORY_SAMPLE_SECONDS"
 
-	ENV_DUCKDB_MEMORY_LIMIT   = "BEMIDB_DUCKDB_MEMORY_LIMIT"
-	ENV_DUCKDB_TEMP_DIRECTORY = "BEMIDB_DUCKDB_TEMP_DIRECTORY"
-	ENV_DUCKDB_THREADS        = "BEMIDB_DUCKDB_THREADS"
-	ENV_MAX_RESULT_MB         = "BEMIDB_MAX_RESULT_MB"
+	ENV_DUCKDB_MEMORY_LIMIT                 = "BEMIDB_DUCKDB_MEMORY_LIMIT"
+	ENV_DUCKDB_TEMP_DIRECTORY               = "BEMIDB_DUCKDB_TEMP_DIRECTORY"
+	ENV_DUCKDB_THREADS                      = "BEMIDB_DUCKDB_THREADS"
+	ENV_MAX_RESULT_MB                       = "BEMIDB_MAX_RESULT_MB"
+	ENV_DUCKDB_ALLOCATOR_BACKGROUND_THREADS = "BEMIDB_DUCKDB_ALLOCATOR_BACKGROUND_THREADS"
+	ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD    = "BEMIDB_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD"
+	ENV_DUCKDB_CONN_MAX_LIFETIME_MINUTES    = "BEMIDB_DUCKDB_CONN_MAX_LIFETIME_MINUTES"
 
 	ENV_PARQUET_ROW_GROUP_SIZE_MB    = "BEMIDB_PARQUET_ROW_GROUP_SIZE_MB"
 	ENV_PARQUET_PAYLOAD_THRESHOLD_MB = "BEMIDB_PARQUET_PAYLOAD_THRESHOLD_MB"
@@ -78,6 +116,9 @@ const (
 	DEFAULT_DB_STORAGE_TYPE = "LOCAL"
 
 	DEFAULT_AWS_S3_ENDPOINT = "s3.amazonaws.com"
+
+	DEFAULT_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD = "64MB"
+	DEFAULT_DUCKDB_CONN_MAX_LIFETIME_MINUTES = 30
 
 	PPROF_PORT = "6060"
 
@@ -106,28 +147,31 @@ type PgConfig struct {
 }
 
 type Config struct {
-	Host                      string
-	Port                      string
-	Database                  string
-	User                      string
-	EncryptedPassword         string
-	EnableCache               bool
-	EnableHttpConnectionCache bool
-	EnablePprof               bool
-	MetricsPort               string
-	MemorySampleSeconds       int
-	DuckDbMemoryLimit         string
-	DuckDbTempDirectory       string
-	DuckDbThreads             int
-	MaxResultMb               int
-	ParquetRowGroupSizeMb     int
-	ParquetPayloadThresholdMb int
-	LogLevel                  string
-	StorageType               string
-	StoragePath               string
-	Aws                       AwsConfig
-	Pg                        PgConfig
-	DisableAnonymousAnalytics bool
+	Host                             string
+	Port                             string
+	Database                         string
+	User                             string
+	EncryptedPassword                string
+	EnableCache                      bool
+	EnableHttpConnectionCache        bool
+	EnablePprof                      bool
+	MetricsPort                      string
+	MemorySampleSeconds              int
+	DuckDbMemoryLimit                string
+	DuckDbTempDirectory              string
+	DuckDbThreads                    int
+	MaxResultMb                      int
+	DuckDbAllocatorBackgroundThreads bool
+	DuckDbAllocatorFlushThreshold    string
+	DuckDbConnMaxLifetimeMinutes     int
+	ParquetRowGroupSizeMb            int
+	ParquetPayloadThresholdMb        int
+	LogLevel                         string
+	StorageType                      string
+	StoragePath                      string
+	Aws                              AwsConfig
+	Pg                               PgConfig
+	DisableAnonymousAnalytics        bool
 }
 
 type configParseValues struct {
@@ -159,6 +203,9 @@ func registerFlags() {
 	flag.StringVar(&_config.DuckDbTempDirectory, "duckdb-temp-directory", os.Getenv(ENV_DUCKDB_TEMP_DIRECTORY), "(Optional) DuckDB temp_directory for spilling to disk. Defaults to the OS temp dir so a memory limit can spill instead of erroring.")
 	flag.IntVar(&_config.DuckDbThreads, "duckdb-threads", intFromEnv(ENV_DUCKDB_THREADS), "(Optional) DuckDB threads. Caps scan parallelism to bound peak memory. Defaults to DuckDB's own default (all host cores).")
 	flag.IntVar(&_config.MaxResultMb, "max-result-mb", intFromEnv(ENV_MAX_RESULT_MB), "(Optional) Maximum result payload in MB per query. Results are buffered in memory before sending, so unbounded results can OOM the process. 0 disables the cap.")
+	flag.BoolVar(&_config.DuckDbAllocatorBackgroundThreads, "duckdb-allocator-background-threads", boolFromEnvDefaultTrue(ENV_DUCKDB_ALLOCATOR_BACKGROUND_THREADS), "(Optional) Enable jemalloc background threads so freed memory is returned to the OS instead of retained indefinitely. Default: true; \"false\"/\"0\"/\"off\"/\"no\"/\"disable(d)\" (any case, whitespace ignored) restores DuckDB's default.")
+	flag.StringVar(&_config.DuckDbAllocatorFlushThreshold, "duckdb-allocator-flush-threshold", stringFromEnvOrDefault(ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD, DEFAULT_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD), "(Optional) DuckDB allocator_flush_threshold: flush the allocator after any task that peaked above this. Default: \""+DEFAULT_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD+"\". Set \"128MB\" to restore DuckDB's own default.")
+	flag.IntVar(&_config.DuckDbConnMaxLifetimeMinutes, "duckdb-conn-max-lifetime-minutes", intFromEnvOrDefault(ENV_DUCKDB_CONN_MAX_LIFETIME_MINUTES, DEFAULT_DUCKDB_CONN_MAX_LIFETIME_MINUTES), "(Optional) Recycle pooled DuckDB connections after N minutes (between uses, never mid-query); retained allocator memory is released when a connection closes. Default: 30. 0 disables recycling.")
 	flag.IntVar(&_config.ParquetRowGroupSizeMb, "parquet-row-group-size-mb", intFromEnv(ENV_PARQUET_ROW_GROUP_SIZE_MB), "(Optional) Parquet row group size in MB. Smaller values cap the in-memory write buffer. Default: 128")
 	flag.IntVar(&_config.ParquetPayloadThresholdMb, "parquet-payload-threshold-mb", intFromEnv(ENV_PARQUET_PAYLOAD_THRESHOLD_MB), "(Optional) Uncompressed payload (MB) per Parquet file before rolling to a new file. Default: 2048")
 	flag.StringVar(&_config.StoragePath, "storage-path", os.Getenv(ENV_STORAGE_PATH), "Path to the storage folder. Default: \""+DEFAULT_STORAGE_PATH+"\"")
@@ -186,6 +233,19 @@ func parseFlags() {
 	// operator believes they are protected.
 	if _config.MaxResultMb < 0 {
 		panic("--max-result-mb (BEMIDB_MAX_RESULT_MB) must be >= 0, got " + IntToString(_config.MaxResultMb))
+	}
+
+	// Fail fast on a malformed memory size: the SET it feeds is fail-soft
+	// (engine rejection must not crash boot), so a typo like "64XB" would
+	// otherwise boot "successfully" with the OOM mitigation silently absent.
+	if _config.DuckDbAllocatorFlushThreshold != "" && !duckdbMemorySizeRegexp.MatchString(_config.DuckDbAllocatorFlushThreshold) {
+		panic("--duckdb-allocator-flush-threshold (" + ENV_DUCKDB_ALLOCATOR_FLUSH_THRESHOLD + ") must be a memory size like \"64MB\", got " + _config.DuckDbAllocatorFlushThreshold)
+	}
+	// Same validation for the OOM-critical memory limit: its SET is fail-hard at
+	// boot, so catching the malformed value here names the flag instead of
+	// surfacing a raw engine error mid-startup.
+	if _config.DuckDbMemoryLimit != "" && !duckdbMemorySizeRegexp.MatchString(_config.DuckDbMemoryLimit) {
+		panic("--duckdb-memory-limit (" + ENV_DUCKDB_MEMORY_LIMIT + ") must be a memory size like \"4GB\", got " + _config.DuckDbMemoryLimit)
 	}
 
 	if _config.Host == "" {

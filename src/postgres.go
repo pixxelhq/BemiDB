@@ -110,6 +110,12 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 	}
 	postgres.writeMessages(messages...)
 
+	// Release the statement's DuckDB-side plan on every exit from this exchange —
+	// the Sync return, a dead connection, or a panic. Statements were previously
+	// never closed anywhere (database/sql requires Stmt.Close), leaking each bound
+	// plan into DuckDB's C++ memory for the life of the pooled connection.
+	defer func() { preparedStatement.Close() }()
+
 	var previousErr error
 	for {
 		message, err := postgres.backend.Receive()
@@ -124,6 +130,8 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			}
 
 			LogDebug(postgres.config, "Binding query", message.PreparedStatement)
+			// Handlers return the input statement even on error, so ownership (and
+			// the deferred Close) is never lost to a nil overwrite.
 			messages, preparedStatement, err = queryHandler.HandleBindQuery(message, preparedStatement)
 			if err != nil {
 				postgres.writeError(err)
@@ -161,18 +169,35 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			}
 
 			LogDebug(postgres.config, "Closing", string(message.ObjectType), message.Name)
-			if preparedStatement.Rows != nil {
+			// Postgres semantics: Close('S') releases the statement; Close('P')
+			// releases only the portal — the statement must stay bindable (JDBC
+			// cursor clients close portals mid-exchange and Bind again). Closing a
+			// name that isn't the current one is a no-op answered with
+			// CloseComplete, like Postgres closing an unknown statement — pgjdbc
+			// statement-cache evictions interleave closes of OLD statements into
+			// the current exchange. Statement release is idempotent with the
+			// deferred Close; a later Describe/Execute on a closed statement gets
+			// an error from the guarded handlers, not a crash.
+			if message.ObjectType == 'S' {
+				if message.Name == preparedStatement.Name {
+					preparedStatement.Close()
+				}
+			} else if message.Name == preparedStatement.Portal && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
+				preparedStatement.Rows = nil
 			}
 			postgres.writeMessages(&pgproto3.CloseComplete{})
 		case *pgproto3.Sync:
 			LogDebug(postgres.config, "Syncing query")
-			// Sync must always respond, so unlike the guarded cases above it runs
-			// even after an error — when a Bind/Describe failure has left
-			// preparedStatement nil. Guard the pointer, then release rows left open
-			// by a Describe that was never followed by Execute (Close is idempotent).
+			// Sync must always respond, even after an error. Release rows left open
+			// by a Describe never followed by Execute: this Sync may not exit the
+			// exchange (psycopg sends Parse->Sync->Bind->...), so rows can't wait
+			// for the deferred Close. Handlers return the statement even on error,
+			// so it can't be nil here — the guard only protects against a future
+			// handler regressing that contract.
 			if preparedStatement != nil && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
+				preparedStatement.Rows = nil
 			}
 			postgres.writeMessages(
 				&pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE},
