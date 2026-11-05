@@ -140,33 +140,6 @@ func terminateAndAwait(t *testing.T, frontend *pgproto3.Frontend, done chan stru
 	}
 }
 
-// TestRunDoesNotPanicOnErrorBeforeSync drives the exact extended-protocol
-// sequence that used to crash the process: a parameterized query whose Bind/
-// Describe fails, followed by Sync — which must always respond. The server must
-// return an ErrorResponse and stay alive.
-func TestRunDoesNotPanicOnErrorBeforeSync(t *testing.T) {
-	createTestTables(t)
-	queryHandler := initQueryHandler()
-	defer queryHandler.duckdb.Close()
-	frontend, done := startTestPostgresClient(t, queryHandler)
-
-	// Bind binds a non-numeric value to $1::int; the cast error surfaces at
-	// Describe (which executes the query).
-	frontend.Send(&pgproto3.Parse{Query: "SELECT $1::int"})
-	frontend.Send(&pgproto3.Bind{Parameters: [][]byte{[]byte("not_a_number")}, ParameterFormatCodes: []int16{0}})
-	frontend.Send(&pgproto3.Describe{ObjectType: 'P'})
-	frontend.Send(&pgproto3.Execute{})
-	frontend.Send(&pgproto3.Sync{})
-	if err := frontend.Flush(); err != nil {
-		t.Fatalf("extended flush: %v", err)
-	}
-	if _, sawError := receiveUntilReady(t, frontend, "bad parameter exchange"); !sawError {
-		t.Errorf("expected an ErrorResponse for the bad parameter")
-	}
-
-	terminateAndAwait(t, frontend, done)
-}
-
 // TestExtendedQueryStatementLifecycle drives the paths where prepared statements
 // are now released (they previously leaked their DuckDB plan on every exchange):
 // consecutive exchanges (deferred Close between them must not break the

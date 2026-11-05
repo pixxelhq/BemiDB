@@ -184,11 +184,11 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			postgres.writeMessages(&pgproto3.CloseComplete{})
 		case *pgproto3.Sync:
 			LogDebug(postgres.config, "Syncing query")
-			// Sync must always respond, even after an error. Release rows left open
-			// by a Describe never followed by Execute: this Sync may not exit the
-			// exchange (psycopg sends Parse->Sync->Bind->...), so rows can't wait
-			// for the deferred Close. Handlers return the statement even on error,
-			// so it's nil here only after a Parse error.
+			// Sync must always respond, even after an error. Drop the statement's
+			// rows. This matters when Sync doesn't end the exchange (no Bind or
+			// Describe yet): after Parse->Execute->Sync, a later Execute must run
+			// the query again instead of reading the closed rows. Handlers return
+			// the statement even on error, so it's nil here only after a Parse error.
 			if preparedStatement != nil && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
 				preparedStatement.Rows = nil
