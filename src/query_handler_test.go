@@ -1199,7 +1199,97 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {Uint32ToString(pgtype.OIDOID), Uint32ToString(pgtype.TextOID)},
 				"values":      {"10", "bemidb"},
 			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"10"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT t1.id FROM test_table t1 JOIN test_table t2 ON t1.id = t2.id": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"10"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table WHERE id IN (SELECT id FROM test_table)": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"10"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table UNION SELECT id FROM test_table": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"10"},
+			},
+			"WITH test_table AS (SELECT 10 AS id), doubled AS (SELECT id * 2 AS id FROM test_table) SELECT id FROM doubled": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"20"},
+			},
+			"WITH pg_roles AS (SELECT 42 AS oid) SELECT oid FROM pg_roles": {
+				"description": {"oid"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"42"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT COUNT(*) AS count FROM public.test_table": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"2"},
+			},
+			"SELECT COUNT(*) AS count FROM (WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table) cte_result, test_table": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"2"},
+			},
+			"WITH test_table AS (SELECT id FROM test_table) SELECT COUNT(*) AS count FROM test_table": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"2"},
+			},
+			"WITH a AS (SELECT id FROM test_table), test_table AS (SELECT 99 AS id) SELECT MAX(id) AS max FROM a": {
+				"description": {"max"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"2"},
+			},
+			"WITH RECURSIVE test_table AS (SELECT 10 AS id UNION ALL SELECT id + 1 FROM test_table WHERE id < 12) SELECT MAX(id) AS max FROM test_table": {
+				"description": {"max"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"12"},
+			},
+			"SELECT COUNT(*) AS count FROM ((WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table) UNION ALL (SELECT id FROM test_table)) u": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"3"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT id FROM (WITH test_table AS (SELECT id + 1 AS id FROM test_table) SELECT id FROM test_table) s": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"11"},
+			},
 		})
+	})
+
+	t.Run("WITH names skip the Iceberg table lookup", func(t *testing.T) {
+		// A lookup miss reloads the table list from storage, which drops this marker
+		remapperTable := queryHandler.queryRemapper.remapperTable
+		marker := IcebergSchemaTable{Schema: "public", Table: "reload_marker"}
+
+		for _, query := range []string{
+			"WITH a AS (SELECT 1 AS id), b AS (SELECT id FROM a) SELECT id FROM b",
+			"WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t WHERE n IN (SELECT n FROM t)",
+		} {
+			remapperTable.icebergSchemaTables.Add(marker)
+			_, _, err := queryHandler.queryRemapper.ParseAndRemapQuery(query)
+			testNoError(t, err)
+			if !remapperTable.icebergSchemaTables.Contains(marker) {
+				t.Errorf("Expected the WITH names not to reload the table list: %s", query)
+			}
+		}
+
+		// Control: an unknown table does reload it
+		_, _, err := queryHandler.queryRemapper.ParseAndRemapQuery("SELECT * FROM non_existent_table")
+		testNoError(t, err)
+		if remapperTable.icebergSchemaTables.Contains(marker) {
+			t.Errorf("Expected an unknown table to reload the table list")
+		}
 	})
 
 	t.Run("ORDER BY", func(t *testing.T) {
