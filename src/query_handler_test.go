@@ -1649,11 +1649,11 @@ func TestHandleExtendedQueryPlansOnFirstUse(t *testing.T) {
 			&pgproto3.NoData{},
 		})
 		if preparedStatement.Statement != nil {
-			t.Errorf("Expected no plan before a bound portal is described or executed")
+			t.Errorf("Expected no plan before a Describe after Bind, or an Execute")
 		}
 	})
 
-	t.Run("Plans on Describe of a bound portal and reuses the plan after a re-Bind", func(t *testing.T) {
+	t.Run("Plans on Describe after Bind, and Execute after a re-Bind reuses the prepared statement", func(t *testing.T) {
 		_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{Query: "SELECT id FROM test_table WHERE id = $1::int"})
 		testNoError(t, err)
 		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{Parameters: [][]byte{[]byte("1")}}, preparedStatement)
@@ -1662,7 +1662,7 @@ func TestHandleExtendedQueryPlansOnFirstUse(t *testing.T) {
 		testNoError(t, err)
 		statement := preparedStatement.Statement
 		if statement == nil {
-			t.Fatalf("Expected Describe of a bound portal to plan the statement")
+			t.Fatalf("Expected Describe after Bind to plan the statement")
 		}
 
 		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{Parameters: [][]byte{[]byte("2")}}, preparedStatement)
@@ -1676,7 +1676,7 @@ func TestHandleExtendedQueryPlansOnFirstUse(t *testing.T) {
 		})
 		testDataRowValues(t, messages[0], []string{"2"})
 		if preparedStatement.Statement != statement {
-			t.Errorf("Expected Execute after a re-Bind to reuse the plan")
+			t.Errorf("Expected Execute after a re-Bind to reuse the prepared statement")
 		}
 	})
 

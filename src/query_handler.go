@@ -372,10 +372,11 @@ func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]p
 	return []pgproto3.Message{&pgproto3.ParseComplete{}}, preparedStatement, nil
 }
 
-// prepare plans the statement in DuckDB on first use (Describe of a bound portal or
+// prepare plans the statement in DuckDB on first use (a Describe after Bind, or an
 // Execute) rather than at Parse: planning reads every table's Iceberg metadata, and
 // clients such as pgjdbc's getParameterMetaData() send Parse->Describe(S)->Sync
-// round trips that never execute. The plan is reused until the statement is closed.
+// round trips that never execute. Later calls reuse the prepared statement, though
+// DuckDB re-reads the metadata whenever a statement with parameters runs.
 func (queryHandler *QueryHandler) prepare(preparedStatement *PreparedStatement) error {
 	if preparedStatement.Closed { // Statement released by a wire-protocol Close
 		return fmt.Errorf("prepared statement was already closed: %s", preparedStatement.OriginalQuery)
