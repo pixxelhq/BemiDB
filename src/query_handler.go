@@ -37,7 +37,6 @@ type PreparedStatement struct {
 	Name          string
 	OriginalQuery string
 	Query         string
-	Statement     *sql.Stmt
 	ParameterOIDs []uint32
 
 	// Bind
@@ -49,7 +48,11 @@ type PreparedStatement struct {
 	Described bool
 
 	// Describe/Execute
-	Rows *sql.Rows
+	Statement *sql.Stmt // Planned on first use, see prepare()
+	Rows      *sql.Rows
+
+	// Close
+	Closed bool
 }
 
 // Close releases the driver-side resources this statement pins. database/sql
@@ -58,11 +61,13 @@ type PreparedStatement struct {
 // statement keeps its bound plan alive in DuckDB's C++ memory — invisible to
 // both the Go heap and duckdb_memory() — for the life of its pooled connection.
 // Rows close first so the driver doesn't defer the statement close behind an
-// open result. Nil-safe and idempotent.
+// open result. The statement is marked closed, so prepare() won't plan it again.
+// Nil-safe and idempotent.
 func (preparedStatement *PreparedStatement) Close() {
 	if preparedStatement == nil {
 		return
 	}
+	preparedStatement.Closed = true
 	if preparedStatement.Rows != nil {
 		preparedStatement.Rows.Close()
 		preparedStatement.Rows = nil
@@ -344,7 +349,6 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 }
 
 func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]pgproto3.Message, *PreparedStatement, error) {
-	ctx := context.Background()
 	originalQuery := string(message.Query)
 	queryStatements, _, err := queryHandler.queryRemapper.ParseAndRemapQuery(originalQuery)
 	if err != nil {
@@ -363,15 +367,29 @@ func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]p
 		return []pgproto3.Message{&pgproto3.ParseComplete{}}, preparedStatement, nil
 	}
 
-	query := queryStatements[0]
-	preparedStatement.Query = query
-	statement, err := queryHandler.duckdb.PrepareContext(ctx, query)
-	preparedStatement.Statement = statement
-	if err != nil {
-		return nil, nil, err
-	}
+	preparedStatement.Query = queryStatements[0]
 
 	return []pgproto3.Message{&pgproto3.ParseComplete{}}, preparedStatement, nil
+}
+
+// prepare plans the statement in DuckDB on first use (Describe of a bound portal or
+// Execute) rather than at Parse: planning reads every table's Iceberg metadata, and
+// clients such as pgjdbc's getParameterMetaData() send Parse->Describe(S)->Sync
+// round trips that never execute. The plan is reused until the statement is closed.
+func (queryHandler *QueryHandler) prepare(preparedStatement *PreparedStatement) error {
+	if preparedStatement.Closed { // Statement released by a wire-protocol Close
+		return fmt.Errorf("prepared statement was already closed: %s", preparedStatement.OriginalQuery)
+	}
+	if preparedStatement.Statement != nil {
+		return nil
+	}
+
+	statement, err := queryHandler.duckdb.PrepareContext(context.Background(), preparedStatement.Query)
+	if err != nil {
+		return err
+	}
+	preparedStatement.Statement = statement
+	return nil
 }
 
 func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
@@ -489,8 +507,8 @@ func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe
 	if preparedStatement.Query == "" || !preparedStatement.Bound { // Empty query or Parse->[No Bind]->Describe
 		return []pgproto3.Message{&pgproto3.NoData{}}, preparedStatement, nil
 	}
-	if preparedStatement.Statement == nil { // Statement released by a wire-protocol Close
-		return nil, preparedStatement, fmt.Errorf("prepared statement was already closed: %s", preparedStatement.OriginalQuery)
+	if err := queryHandler.prepare(preparedStatement); err != nil {
+		return nil, preparedStatement, err
 	}
 
 	rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
@@ -516,8 +534,8 @@ func (queryHandler *QueryHandler) HandleExecuteQuery(message *pgproto3.Execute, 
 	}
 
 	if preparedStatement.Rows == nil { // Parse->[No Bind]->Describe->Execute or Parse->Bind->[No Describe]->Execute
-		if preparedStatement.Statement == nil { // Statement released by a wire-protocol Close
-			return nil, fmt.Errorf("prepared statement was already closed: %s", preparedStatement.OriginalQuery)
+		if err := queryHandler.prepare(preparedStatement); err != nil {
+			return nil, err
 		}
 		rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
 		if err != nil {

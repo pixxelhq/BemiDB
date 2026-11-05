@@ -104,9 +104,12 @@ func (postgres *Postgres) handleSimpleQuery(queryHandler *QueryHandler, queryMes
 func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseMessage *pgproto3.Parse) error {
 	LogDebug(postgres.config, "Parsing query", parseMessage.Query)
 	messages, preparedStatement, err := queryHandler.HandleParseQuery(parseMessage)
+	var previousErr error
 	if err != nil {
-		postgres.writeError(err)
-		return nil
+		// Skip to Sync like any other error: returning would hand the rest of the
+		// batch (Bind, Sync, ...) to Run, which drops the connection.
+		postgres.writeErrorResponse(err)
+		previousErr = err
 	}
 	postgres.writeMessages(messages...)
 
@@ -116,7 +119,6 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 	// plan into DuckDB's C++ memory for the life of the pooled connection.
 	defer func() { preparedStatement.Close() }()
 
-	var previousErr error
 	for {
 		message, err := postgres.backend.Receive()
 		if err != nil {
@@ -134,7 +136,7 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			// the deferred Close) is never lost to a nil overwrite.
 			messages, preparedStatement, err = queryHandler.HandleBindQuery(message, preparedStatement)
 			if err != nil {
-				postgres.writeError(err)
+				postgres.writeErrorResponse(err)
 				previousErr = err
 			}
 			postgres.writeMessages(messages...)
@@ -147,7 +149,7 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			var messages []pgproto3.Message
 			messages, preparedStatement, err = queryHandler.HandleDescribeQuery(message, preparedStatement)
 			if err != nil {
-				postgres.writeError(err)
+				postgres.writeErrorResponse(err)
 				previousErr = err
 			}
 			postgres.writeMessages(messages...)
@@ -159,7 +161,7 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			LogDebug(postgres.config, "Executing query", message.Portal)
 			messages, err := queryHandler.HandleExecuteQuery(message, preparedStatement)
 			if err != nil {
-				postgres.writeError(err)
+				postgres.writeErrorResponse(err)
 				previousErr = err
 			}
 			postgres.writeMessages(messages...)
@@ -193,8 +195,7 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			// by a Describe never followed by Execute: this Sync may not exit the
 			// exchange (psycopg sends Parse->Sync->Bind->...), so rows can't wait
 			// for the deferred Close. Handlers return the statement even on error,
-			// so it can't be nil here — the guard only protects against a future
-			// handler regressing that contract.
+			// so it's nil here only after a Parse error.
 			if preparedStatement != nil && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
 				preparedStatement.Rows = nil
@@ -231,6 +232,20 @@ func (postgres *Postgres) writeError(err error) {
 			Message:  err.Error(),
 		},
 		&pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE},
+	)
+}
+
+// Extended query protocol: after an error the server skips messages until Sync,
+// which sends the only ReadyForQuery. Clients such as pgjdbc stop reading at the
+// first ReadyForQuery, so a second one would be read as the reply to their next query.
+func (postgres *Postgres) writeErrorResponse(err error) {
+	LogError(postgres.config, err.Error())
+
+	postgres.writeMessages(
+		&pgproto3.ErrorResponse{
+			Severity: "ERROR",
+			Message:  err.Error(),
+		},
 	)
 }
 

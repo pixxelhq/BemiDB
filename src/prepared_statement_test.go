@@ -68,8 +68,8 @@ func TestDescribeAndExecuteAfterStatementClosed(t *testing.T) {
 		OriginalQuery: "SELECT 1",
 		Query:         "SELECT 1",
 		Bound:         true,
-		Statement:     nil, // released by PreparedStatement.Close()
 	}
+	preparedStatement.Close() // as a wire-protocol Close('S') does
 
 	if _, _, err := queryHandler.HandleDescribeQuery(&pgproto3.Describe{ObjectType: 'P'}, preparedStatement); err == nil {
 		t.Errorf("expected Describe on closed statement to error")
