@@ -104,9 +104,12 @@ func (postgres *Postgres) handleSimpleQuery(queryHandler *QueryHandler, queryMes
 func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseMessage *pgproto3.Parse) error {
 	LogDebug(postgres.config, "Parsing query", parseMessage.Query)
 	messages, preparedStatement, err := queryHandler.HandleParseQuery(parseMessage)
+	var previousErr error
 	if err != nil {
-		postgres.writeError(err)
-		return nil
+		// Skip to Sync like any other error: returning would hand the rest of the
+		// batch (Bind, Sync, ...) to Run, which drops the connection.
+		postgres.writeErrorResponse(err)
+		previousErr = err
 	}
 	postgres.writeMessages(messages...)
 
@@ -116,58 +119,50 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 	// plan into DuckDB's C++ memory for the life of the pooled connection.
 	defer func() { preparedStatement.Close() }()
 
-	var previousErr error
 	for {
 		message, err := postgres.backend.Receive()
 		if err != nil {
 			return err
 		}
 
+		// After an error, skip everything until Sync, as Postgres does (Terminate still
+		// ends the connection). This also keeps the cases below from using the nil
+		// statement that a Parse error leaves.
+		_, isSync := message.(*pgproto3.Sync)
+		_, isTerminate := message.(*pgproto3.Terminate)
+		if previousErr != nil && !isSync && !isTerminate {
+			continue
+		}
+
 		switch message := message.(type) {
 		case *pgproto3.Bind:
-			if previousErr != nil { // Skip processing the next message if there was an error in the previous message
-				continue
-			}
-
 			LogDebug(postgres.config, "Binding query", message.PreparedStatement)
 			// Handlers return the input statement even on error, so ownership (and
 			// the deferred Close) is never lost to a nil overwrite.
 			messages, preparedStatement, err = queryHandler.HandleBindQuery(message, preparedStatement)
 			if err != nil {
-				postgres.writeError(err)
+				postgres.writeErrorResponse(err)
 				previousErr = err
 			}
 			postgres.writeMessages(messages...)
 		case *pgproto3.Describe:
-			if previousErr != nil { // Skip processing the next message if there was an error in the previous message
-				continue
-			}
-
 			LogDebug(postgres.config, "Describing query", message.Name, "("+string(message.ObjectType)+")")
 			var messages []pgproto3.Message
 			messages, preparedStatement, err = queryHandler.HandleDescribeQuery(message, preparedStatement)
 			if err != nil {
-				postgres.writeError(err)
+				postgres.writeErrorResponse(err)
 				previousErr = err
 			}
 			postgres.writeMessages(messages...)
 		case *pgproto3.Execute:
-			if previousErr != nil { // Skip processing the next message if there was an error in the previous message
-				continue
-			}
-
 			LogDebug(postgres.config, "Executing query", message.Portal)
 			messages, err := queryHandler.HandleExecuteQuery(message, preparedStatement)
 			if err != nil {
-				postgres.writeError(err)
+				postgres.writeErrorResponse(err)
 				previousErr = err
 			}
 			postgres.writeMessages(messages...)
 		case *pgproto3.Close:
-			if previousErr != nil { // Skip processing the next message if there was an error in the previous message
-				continue
-			}
-
 			LogDebug(postgres.config, "Closing", string(message.ObjectType), message.Name)
 			// Postgres semantics: Close('S') releases the statement; Close('P')
 			// releases only the portal — the statement must stay bindable (JDBC
@@ -176,8 +171,8 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			// CloseComplete, like Postgres closing an unknown statement — pgjdbc
 			// statement-cache evictions interleave closes of OLD statements into
 			// the current exchange. Statement release is idempotent with the
-			// deferred Close; a later Describe/Execute on a closed statement gets
-			// an error from the guarded handlers, not a crash.
+			// deferred Close; a later Execute, or Describe after Bind, on a closed
+			// statement gets an error from prepare(), not a crash.
 			if message.ObjectType == 'S' {
 				if message.Name == preparedStatement.Name {
 					preparedStatement.Close()
@@ -189,12 +184,11 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			postgres.writeMessages(&pgproto3.CloseComplete{})
 		case *pgproto3.Sync:
 			LogDebug(postgres.config, "Syncing query")
-			// Sync must always respond, even after an error. Release rows left open
-			// by a Describe never followed by Execute: this Sync may not exit the
-			// exchange (psycopg sends Parse->Sync->Bind->...), so rows can't wait
-			// for the deferred Close. Handlers return the statement even on error,
-			// so it can't be nil here — the guard only protects against a future
-			// handler regressing that contract.
+			// Sync must always respond, even after an error. Drop the statement's
+			// rows. This matters when Sync doesn't end the exchange (no Bind or
+			// Describe yet): after Parse->Execute->Sync, a later Execute must run
+			// the query again instead of reading the closed rows. Handlers return
+			// the statement even on error, so it's nil here only after a Parse error.
 			if preparedStatement != nil && preparedStatement.Rows != nil {
 				preparedStatement.Rows.Close()
 				preparedStatement.Rows = nil
@@ -210,6 +204,9 @@ func (postgres *Postgres) handleExtendedQuery(queryHandler *QueryHandler, parseM
 			}
 			// Otherwise, wait for Bind/Describe/Execute/Sync.
 			// For example, psycopg sends Parse->[extra Sync]->Bind->Describe->Execute->Sync
+		case *pgproto3.Terminate:
+			LogDebug(postgres.config, "Client terminated connection")
+			return errors.New("client terminated connection")
 		}
 	}
 }
@@ -222,7 +219,17 @@ func (postgres *Postgres) writeMessages(messages ...pgproto3.Message) {
 	(*postgres.conn).Write(buf)
 }
 
+// writeError ends a simple query (or a failed startup) with an ErrorResponse and a ReadyForQuery.
 func (postgres *Postgres) writeError(err error) {
+	postgres.writeErrorResponse(err)
+	postgres.writeMessages(&pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE})
+}
+
+// writeErrorResponse sends an ErrorResponse without a ReadyForQuery. Extended query
+// protocol: after an error the server skips messages until Sync, which sends the only
+// ReadyForQuery. Clients such as pgjdbc stop reading at the first ReadyForQuery, so a
+// second one would be read as the reply to their next query.
+func (postgres *Postgres) writeErrorResponse(err error) {
 	LogError(postgres.config, err.Error())
 
 	postgres.writeMessages(
@@ -230,7 +237,6 @@ func (postgres *Postgres) writeError(err error) {
 			Severity: "ERROR",
 			Message:  err.Error(),
 		},
-		&pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE},
 	)
 }
 

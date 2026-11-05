@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
@@ -84,6 +85,48 @@ func receiveUntilReady(t *testing.T, frontend *pgproto3.Frontend, step string) (
 	}
 }
 
+// expectReplies drains replies until ReadyForQuery and fails unless their types
+// match expected, in order.
+func expectReplies(t *testing.T, frontend *pgproto3.Frontend, step string, expected []pgproto3.BackendMessage) {
+	t.Helper()
+	var got, want []string
+	for _, msg := range expected {
+		want = append(want, reflect.TypeOf(msg).Elem().Name())
+	}
+	for {
+		msg, err := frontend.Receive()
+		if err != nil {
+			t.Fatalf("%s: receive error after %v (server likely crashed): %v", step, got, err)
+		}
+		got = append(got, reflect.TypeOf(msg).Elem().Name())
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("%s: expected replies %v, got %v", step, want, got)
+	}
+}
+
+// expectFullExchange runs Parse->Bind->Describe->Execute->Sync for SELECT 1 and
+// fails unless it returns rows without an error: the connection is alive and its
+// replies are in step (a leftover ReadyForQuery would end this exchange early).
+func expectFullExchange(t *testing.T, frontend *pgproto3.Frontend, step string) {
+	t.Helper()
+	frontend.Send(&pgproto3.Parse{Query: "SELECT 1"})
+	frontend.Send(&pgproto3.Bind{})
+	frontend.Send(&pgproto3.Describe{ObjectType: 'P'})
+	frontend.Send(&pgproto3.Execute{})
+	frontend.Send(&pgproto3.Sync{})
+	if err := frontend.Flush(); err != nil {
+		t.Fatalf("%s: flush: %v", step, err)
+	}
+	sawRows, sawError := receiveUntilReady(t, frontend, step)
+	if !sawRows || sawError {
+		t.Fatalf("%s: expected data rows and no error, got rows=%v error=%v", step, sawRows, sawError)
+	}
+}
+
 // terminateAndAwait ends the connection and fails the test if the server's
 // connection loop does not return (wedged or panicked).
 func terminateAndAwait(t *testing.T, frontend *pgproto3.Frontend, done chan struct{}) {
@@ -97,37 +140,10 @@ func terminateAndAwait(t *testing.T, frontend *pgproto3.Frontend, done chan stru
 	}
 }
 
-// TestRunDoesNotPanicOnErrorBeforeSync drives the exact extended-protocol
-// sequence that used to crash the process: a parameterized query whose Bind/
-// Describe fails, followed by Sync — which must always respond. The server must
-// return an ErrorResponse and stay alive.
-func TestRunDoesNotPanicOnErrorBeforeSync(t *testing.T) {
-	createTestTables(t)
-	queryHandler := initQueryHandler()
-	defer queryHandler.duckdb.Close()
-	frontend, done := startTestPostgresClient(t, queryHandler)
-
-	// Bind binds a non-numeric value to $1::int; the cast error surfaces at
-	// Describe (which executes the query).
-	frontend.Send(&pgproto3.Parse{Query: "SELECT $1::int"})
-	frontend.Send(&pgproto3.Bind{Parameters: [][]byte{[]byte("not_a_number")}, ParameterFormatCodes: []int16{0}})
-	frontend.Send(&pgproto3.Describe{ObjectType: 'P'})
-	frontend.Send(&pgproto3.Execute{})
-	frontend.Send(&pgproto3.Sync{})
-	if err := frontend.Flush(); err != nil {
-		t.Fatalf("extended flush: %v", err)
-	}
-	if _, sawError := receiveUntilReady(t, frontend, "bad parameter exchange"); !sawError {
-		t.Errorf("expected an ErrorResponse for the bad parameter")
-	}
-
-	terminateAndAwait(t, frontend, done)
-}
-
 // TestExtendedQueryStatementLifecycle drives the paths where prepared statements
 // are now released (they previously leaked their DuckDB plan on every exchange):
 // consecutive exchanges (deferred Close between them must not break the
-// connection), then wire-protocol Close of the statement followed by a Describe
+// connection), then wire-protocol Close of the statement followed by Execute
 // on it (must error, not crash), then a final full exchange proving the
 // connection still serves.
 func TestExtendedQueryStatementLifecycle(t *testing.T) {
@@ -136,28 +152,13 @@ func TestExtendedQueryStatementLifecycle(t *testing.T) {
 	defer queryHandler.duckdb.Close()
 	frontend, done := startTestPostgresClient(t, queryHandler)
 
-	fullExchange := func(step string) {
-		frontend.Send(&pgproto3.Parse{Query: "SELECT 1"})
-		frontend.Send(&pgproto3.Bind{})
-		frontend.Send(&pgproto3.Describe{ObjectType: 'P'})
-		frontend.Send(&pgproto3.Execute{})
-		frontend.Send(&pgproto3.Sync{})
-		if err := frontend.Flush(); err != nil {
-			t.Fatalf("%s: flush: %v", step, err)
-		}
-		sawRows, sawError := receiveUntilReady(t, frontend, step)
-		if !sawRows || sawError {
-			t.Fatalf("%s: expected data rows and no error, got rows=%v error=%v", step, sawRows, sawError)
-		}
-	}
-
 	// Two consecutive successful exchanges: the deferred statement release after
 	// the first must not affect the second.
-	fullExchange("first exchange")
-	fullExchange("second exchange")
+	expectFullExchange(t, frontend, "first exchange")
+	expectFullExchange(t, frontend, "second exchange")
 
 	// Wire-protocol Close('S') releases the statement mid-exchange; the following
-	// Describe must be answered with an error — previously this shape could only
+	// Execute must be answered with an error — previously this shape could only
 	// crash or silently leak. The connection must survive to the next exchange.
 	frontend.Send(&pgproto3.Parse{Query: "SELECT 1"})
 	frontend.Send(&pgproto3.Close{ObjectType: 'S'})
@@ -167,15 +168,119 @@ func TestExtendedQueryStatementLifecycle(t *testing.T) {
 	if err := frontend.Flush(); err != nil {
 		t.Fatalf("close exchange: flush: %v", err)
 	}
-	// writeError sends its own ReadyForQuery (pre-existing behavior) and Sync sends
-	// another — drain both so the next exchange starts on a clean stream.
-	_, sawErrorOnError := receiveUntilReady(t, frontend, "close exchange (error reply)")
-	_, sawErrorOnSync := receiveUntilReady(t, frontend, "close exchange (sync reply)")
-	if !sawErrorOnError && !sawErrorOnSync {
-		t.Errorf("expected an error for Describe after wire-protocol Close('S')")
+	if _, sawError := receiveUntilReady(t, frontend, "close exchange"); !sawError {
+		t.Errorf("expected an error for Execute after wire-protocol Close('S')")
 	}
 
-	fullExchange("exchange after wire Close")
+	expectFullExchange(t, frontend, "exchange after wire Close")
+
+	terminateAndAwait(t, frontend, done)
+}
+
+// TestExtendedQueryErrorRepliesKeepConnectionInSync pins the extended-protocol
+// error rule for an error at each step: one ErrorResponse, then every message up
+// to Sync is skipped, and Sync sends the only ReadyForQuery. A second
+// ReadyForQuery is read by clients (e.g., pgjdbc) as the reply to their next
+// query, and closing the connection on a Parse error drops it. The full exchange
+// after each failing batch catches both.
+func TestExtendedQueryErrorRepliesKeepConnectionInSync(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+	frontend, done := startTestPostgresClient(t, queryHandler)
+
+	badParameter := [][]byte{[]byte("not_a_number")}
+	errorAfterBind := []pgproto3.BackendMessage{&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.ErrorResponse{}, &pgproto3.ReadyForQuery{}}
+	failingBatches := []struct {
+		step     string
+		messages []pgproto3.FrontendMessage
+		replies  []pgproto3.BackendMessage
+	}{
+		{
+			step:     "Parse error",
+			messages: []pgproto3.FrontendMessage{&pgproto3.Parse{Query: "SELEC 1"}, &pgproto3.Bind{}, &pgproto3.Describe{ObjectType: 'P'}, &pgproto3.Execute{}, &pgproto3.Close{ObjectType: 'S'}, &pgproto3.Sync{}},
+			replies:  []pgproto3.BackendMessage{&pgproto3.ErrorResponse{}, &pgproto3.ReadyForQuery{}},
+		},
+		{
+			step:     "Bind error",
+			messages: []pgproto3.FrontendMessage{&pgproto3.Parse{Query: "SELECT 1"}, &pgproto3.Bind{PreparedStatement: "unknown"}, &pgproto3.Describe{ObjectType: 'P'}, &pgproto3.Execute{}, &pgproto3.Sync{}},
+			replies:  []pgproto3.BackendMessage{&pgproto3.ParseComplete{}, &pgproto3.ErrorResponse{}, &pgproto3.ReadyForQuery{}},
+		},
+		{
+			step:     "planning error at Describe",
+			messages: []pgproto3.FrontendMessage{&pgproto3.Parse{Query: "SELECT * FROM non_existent_table"}, &pgproto3.Bind{}, &pgproto3.Describe{ObjectType: 'P'}, &pgproto3.Execute{}, &pgproto3.Sync{}},
+			replies:  errorAfterBind,
+		},
+		{
+			step:     "execution error at Describe",
+			messages: []pgproto3.FrontendMessage{&pgproto3.Parse{Query: "SELECT $1::int"}, &pgproto3.Bind{Parameters: badParameter}, &pgproto3.Describe{ObjectType: 'P'}, &pgproto3.Execute{}, &pgproto3.Sync{}},
+			replies:  errorAfterBind,
+		},
+		{
+			step:     "planning error at Execute",
+			messages: []pgproto3.FrontendMessage{&pgproto3.Parse{Query: "SELECT * FROM non_existent_table"}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{}},
+			replies:  errorAfterBind,
+		},
+		{
+			step:     "execution error at Execute",
+			messages: []pgproto3.FrontendMessage{&pgproto3.Parse{Query: "SELECT $1::int"}, &pgproto3.Bind{Parameters: badParameter}, &pgproto3.Execute{}, &pgproto3.Sync{}},
+			replies:  errorAfterBind,
+		},
+	}
+	for _, batch := range failingBatches {
+		for _, message := range batch.messages {
+			frontend.Send(message)
+		}
+		if err := frontend.Flush(); err != nil {
+			t.Fatalf("%s: flush: %v", batch.step, err)
+		}
+		expectReplies(t, frontend, batch.step, batch.replies)
+
+		expectFullExchange(t, frontend, "exchange after "+batch.step)
+	}
+
+	terminateAndAwait(t, frontend, done)
+}
+
+// TestTerminateAfterErrorBeforeSync pins that Terminate still ends the connection
+// while the server skips messages after an error, as in Postgres.
+func TestTerminateAfterErrorBeforeSync(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+	frontend, done := startTestPostgresClient(t, queryHandler)
+
+	frontend.Send(&pgproto3.Parse{Query: "SELEC 1"})
+	if err := frontend.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	msg, err := frontend.Receive()
+	if _, ok := msg.(*pgproto3.ErrorResponse); err != nil || !ok {
+		t.Fatalf("expected an ErrorResponse for the Parse error, got %T (%v)", msg, err)
+	}
+
+	terminateAndAwait(t, frontend, done)
+}
+
+// TestDescribeOnlyRoundTrip drives the shape pgjdbc uses for getParameterMetaData():
+// Parse->Describe(S)->Sync with no Bind or Execute. Nothing is planned until the
+// statement runs, so even SQL that can't be planned (an unknown table) gets no
+// error here, and the connection stays ready for the real run.
+func TestDescribeOnlyRoundTrip(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+	frontend, done := startTestPostgresClient(t, queryHandler)
+
+	frontend.Send(&pgproto3.Parse{Query: "SELECT id FROM non_existent_table WHERE id = $1"})
+	frontend.Send(&pgproto3.Describe{ObjectType: 'S'})
+	frontend.Send(&pgproto3.Sync{})
+	if err := frontend.Flush(); err != nil {
+		t.Fatalf("describe-only flush: %v", err)
+	}
+	expectReplies(t, frontend, "describe-only round trip", []pgproto3.BackendMessage{&pgproto3.ParseComplete{}, &pgproto3.NoData{}, &pgproto3.ReadyForQuery{}})
+
+	expectFullExchange(t, frontend, "exchange after describe-only round trip")
 
 	terminateAndAwait(t, frontend, done)
 }

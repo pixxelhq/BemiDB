@@ -1494,8 +1494,8 @@ func TestHandleParseQuery(t *testing.T) {
 		if preparedStatement.Query != remappedQuery {
 			t.Errorf("Expected the prepared statement query to be %v, got %v", remappedQuery, preparedStatement.Query)
 		}
-		if preparedStatement.Statement == nil {
-			t.Errorf("Expected the prepared statement to have a statement")
+		if preparedStatement.Statement != nil {
+			t.Errorf("Expected Parse not to plan the statement (planning happens on first use)")
 		}
 	})
 
@@ -1720,6 +1720,84 @@ func TestHandleExecuteQuery(t *testing.T) {
 		testMessageTypes(t, messages, []pgproto3.Message{
 			&pgproto3.EmptyQueryResponse{},
 		})
+	})
+}
+
+func TestHandleExtendedQueryPlansOnFirstUse(t *testing.T) {
+	createTestTables(t)
+	queryHandler := initQueryHandler()
+	defer queryHandler.duckdb.Close()
+
+	t.Run("Doesn't plan for a describe-only round trip (Parse->Describe(S)->Sync)", func(t *testing.T) {
+		_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{Query: "SELECT id FROM test_table WHERE id = $1"})
+		testNoError(t, err)
+
+		messages, preparedStatement, err := queryHandler.HandleDescribeQuery(&pgproto3.Describe{ObjectType: 'S'}, preparedStatement)
+
+		testNoError(t, err)
+		testMessageTypes(t, messages, []pgproto3.Message{
+			&pgproto3.NoData{},
+		})
+		if preparedStatement.Statement != nil {
+			t.Errorf("Expected no plan before a Describe after Bind, or an Execute")
+		}
+	})
+
+	t.Run("Plans on Describe after Bind, and Execute after a re-Bind reuses the prepared statement", func(t *testing.T) {
+		_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{Query: "SELECT id FROM test_table WHERE id = $1::int"})
+		testNoError(t, err)
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{Parameters: [][]byte{[]byte("1")}}, preparedStatement)
+		testNoError(t, err)
+		_, preparedStatement, err = queryHandler.HandleDescribeQuery(&pgproto3.Describe{ObjectType: 'P'}, preparedStatement)
+		testNoError(t, err)
+		statement := preparedStatement.Statement
+		if statement == nil {
+			t.Fatalf("Expected Describe after Bind to plan the statement")
+		}
+
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{Parameters: [][]byte{[]byte("2")}}, preparedStatement)
+		testNoError(t, err)
+		messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+
+		testNoError(t, err)
+		testMessageTypes(t, messages, []pgproto3.Message{
+			&pgproto3.DataRow{},
+			&pgproto3.CommandComplete{},
+		})
+		testDataRowValues(t, messages[0], []string{"2"})
+		if preparedStatement.Statement != statement {
+			t.Errorf("Expected Execute after a re-Bind to reuse the prepared statement")
+		}
+	})
+
+	t.Run("Reports a planning error at Describe instead of Parse", func(t *testing.T) {
+		_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{Query: "SELECT * FROM non_existent_table"})
+		if err != nil {
+			t.Fatalf("Expected Parse not to report a planning error, got: %v", err)
+		}
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
+		testNoError(t, err)
+
+		_, _, err = queryHandler.HandleDescribeQuery(&pgproto3.Describe{ObjectType: 'P'}, preparedStatement)
+
+		if err == nil || !strings.Contains(err.Error(), "Table with name non_existent_table does not exist") {
+			t.Errorf("Expected a missing table error, got: %v", err)
+		}
+	})
+
+	t.Run("Reports a planning error at Execute instead of Parse", func(t *testing.T) {
+		_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{Query: "SELECT * FROM non_existent_table"})
+		if err != nil {
+			t.Fatalf("Expected Parse not to report a planning error, got: %v", err)
+		}
+		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
+		testNoError(t, err)
+
+		_, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+
+		if err == nil || !strings.Contains(err.Error(), "Table with name non_existent_table does not exist") {
+			t.Errorf("Expected a missing table error, got: %v", err)
+		}
 	})
 }
 
