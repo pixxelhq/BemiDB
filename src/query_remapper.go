@@ -34,6 +34,7 @@ type QueryRemapper struct {
 	remapperShow       *QueryRemapperShow
 	icebergReader      *IcebergReader
 	config             *Config
+	cteNameScopes      []Set[string] // WITH names visible at the current point of the tree walk
 }
 
 func NewQueryRemapper(config *Config, icebergReader *IcebergReader, duckdb *Duckdb) *QueryRemapper {
@@ -106,7 +107,8 @@ func (remapper *QueryRemapper) remapStatements(statements []*pgQuery.RawStmt) ([
 		// SELECT
 		case node.GetSelectStmt() != nil:
 			selectStatement := node.GetSelectStmt()
-			remapper.remapSelectStatement(selectStatement, 1)
+			queryRemapper := *remapper // Copy: cteNameScopes is per query, but the remapper is shared across connections
+			queryRemapper.remapSelectStatement(selectStatement, 1)
 			stmt.Stmt = &pgQuery.Node{Node: &pgQuery.Node_SelectStmt{SelectStmt: selectStatement}}
 			statements[i] = stmt
 
@@ -152,6 +154,16 @@ func (remapper *QueryRemapper) remapSetStatement(stmt *pgQuery.RawStmt) *pgQuery
 }
 
 func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.SelectStmt, indentLevel int) {
+	// WITH names are visible in this whole SELECT (UNION, WHERE, CTEs, FROM, ...) and nowhere else
+	if selectStatement.WithClause != nil {
+		cteNames := make(Set[string])
+		for _, cte := range selectStatement.WithClause.Ctes {
+			cteNames.Add(cte.GetCommonTableExpr().Ctename)
+		}
+		remapper.cteNameScopes = append(remapper.cteNameScopes, cteNames)
+		defer func() { remapper.cteNameScopes = remapper.cteNameScopes[:len(remapper.cteNameScopes)-1] }()
+	}
+
 	// UNION
 	if selectStatement.FromClause == nil && selectStatement.Larg != nil && selectStatement.Rarg != nil {
 		remapper.traceTreeTraversal("UNION left", indentLevel)
@@ -190,7 +202,7 @@ func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.Sel
 			if fromNode.GetRangeVar() != nil {
 				// FROM [TABLE]
 				remapper.traceTreeTraversal("FROM table", indentLevel)
-				selectStatement.FromClause[i] = remapper.remapperTable.RemapTable(fromNode)
+				selectStatement.FromClause[i] = remapper.remapTable(fromNode)
 			} else if fromNode.GetRangeSubselect() != nil {
 				// FROM (SELECT ...)
 				remapper.traceTreeTraversal("FROM subselect", indentLevel)
@@ -235,7 +247,7 @@ func (remapper *QueryRemapper) remapJoinExpressions(selectStatement *pgQuery.Sel
 	} else if leftJoinNode.GetRangeVar() != nil {
 		// TABLE
 		remapper.traceTreeTraversal("TABLE left", indentLevel+1)
-		leftJoinNode = remapper.remapperTable.RemapTable(leftJoinNode)
+		leftJoinNode = remapper.remapTable(leftJoinNode)
 	} else if leftJoinNode.GetRangeSubselect() != nil {
 		leftSelectStatement := leftJoinNode.GetRangeSubselect().Subquery.GetSelectStmt()
 		remapper.remapSelectStatement(leftSelectStatement, indentLevel+1) // parent-recursion
@@ -253,7 +265,7 @@ func (remapper *QueryRemapper) remapJoinExpressions(selectStatement *pgQuery.Sel
 	} else if rightJoinNode.GetRangeVar() != nil {
 		// TABLE
 		remapper.traceTreeTraversal("TABLE right", indentLevel+1)
-		rightJoinNode = remapper.remapperTable.RemapTable(rightJoinNode)
+		rightJoinNode = remapper.remapTable(rightJoinNode)
 	} else if rightJoinNode.GetRangeSubselect() != nil {
 		rightSelectStatement := rightJoinNode.GetRangeSubselect().Subquery.GetSelectStmt()
 		remapper.remapSelectStatement(rightSelectStatement, indentLevel+1) // parent-recursion
@@ -385,6 +397,20 @@ func (remapper *QueryRemapper) remappedExpressions(node *pgQuery.Node, indentLev
 	}
 
 	return remapper.remapperExpression.RemappedExpression(node)
+}
+
+// FROM/JOIN [TABLE] -> leave references to the query's own WITH names as is, without an Iceberg lookup
+func (remapper *QueryRemapper) remapTable(node *pgQuery.Node) *pgQuery.Node {
+	rangeVar := node.GetRangeVar()
+	if rangeVar.Schemaname == "" {
+		for _, cteNames := range remapper.cteNameScopes {
+			if cteNames.Contains(rangeVar.Relname) {
+				return node
+			}
+		}
+	}
+
+	return remapper.remapperTable.RemapTable(node)
 }
 
 // FROM/JOIN FUNCTION(args) -> remap the function call itself and the expressions in its args

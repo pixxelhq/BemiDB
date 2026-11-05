@@ -1199,6 +1199,46 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {Uint32ToString(pgtype.OIDOID), Uint32ToString(pgtype.TextOID)},
 				"values":      {"10", "bemidb"},
 			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"10"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT t1.id FROM test_table t1 JOIN test_table t2 ON t1.id = t2.id": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"10"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table WHERE id IN (SELECT id FROM test_table)": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"10"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table UNION SELECT id FROM test_table": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"10"},
+			},
+			"WITH test_table AS (SELECT 10 AS id), doubled AS (SELECT id * 2 AS id FROM test_table) SELECT id FROM doubled": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"20"},
+			},
+			"WITH pg_roles AS (SELECT 42 AS oid) SELECT oid FROM pg_roles": {
+				"description": {"oid"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"42"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT COUNT(*) AS count FROM public.test_table": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"2"},
+			},
+			"SELECT COUNT(*) AS count FROM (WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table) cte_result, test_table": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"2"},
+			},
 		})
 	})
 
