@@ -26,6 +26,7 @@ var KNOWN_SET_STATEMENTS = NewSet([]string{
 var NOOP_QUERY_TREE, _ = pgQuery.Parse("SET TimeZone = 'UTC'")
 
 type QueryRemapper struct {
+	parserTable        *ParserTable
 	parserTypeCast     *ParserTypeCast
 	remapperTable      *QueryRemapperTable
 	remapperExpression *QueryRemapperExpression
@@ -34,11 +35,11 @@ type QueryRemapper struct {
 	remapperShow       *QueryRemapperShow
 	icebergReader      *IcebergReader
 	config             *Config
-	cteNameScopes      []Set[string] // WITH names visible at the current point of the tree walk
 }
 
 func NewQueryRemapper(config *Config, icebergReader *IcebergReader, duckdb *Duckdb) *QueryRemapper {
 	return &QueryRemapper{
+		parserTable:        NewParserTable(config),
 		parserTypeCast:     NewParserTypeCast(config),
 		remapperTable:      NewQueryRemapperTable(config, icebergReader, duckdb),
 		remapperExpression: NewQueryRemapperExpression(config),
@@ -107,8 +108,8 @@ func (remapper *QueryRemapper) remapStatements(statements []*pgQuery.RawStmt) ([
 		// SELECT
 		case node.GetSelectStmt() != nil:
 			selectStatement := node.GetSelectStmt()
-			queryRemapper := *remapper // Copy: cteNameScopes is per query, but the remapper is shared across connections
-			queryRemapper.remapSelectStatement(selectStatement, 1)
+			walk := &QueryRemapperWalk{QueryRemapper: remapper}
+			walk.remapSelectStatement(selectStatement, 1)
 			stmt.Stmt = &pgQuery.Node{Node: &pgQuery.Node_SelectStmt{SelectStmt: selectStatement}}
 			statements[i] = stmt
 
@@ -153,15 +154,33 @@ func (remapper *QueryRemapper) remapSetStatement(stmt *pgQuery.RawStmt) *pgQuery
 	return NOOP_QUERY_TREE.Stmts[0]
 }
 
-func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.SelectStmt, indentLevel int) {
-	// WITH names are visible in this whole SELECT (UNION, WHERE, CTEs, FROM, ...) and nowhere else
-	if selectStatement.WithClause != nil {
+// QueryRemapperWalk remaps one SELECT statement. The QueryRemapper is shared by all
+// connections, so state that belongs to a single statement's tree walk lives here.
+type QueryRemapperWalk struct {
+	*QueryRemapper
+	cteNameScopes []Set[string] // WITH names visible at the current point of the walk
+}
+
+func (remapper *QueryRemapperWalk) remapSelectStatement(selectStatement *pgQuery.SelectStmt, indentLevel int) {
+	// WITH: as in Postgres, a CTE body sees only the CTEs listed before it (all of them
+	// under RECURSIVE), and the rest of this SELECT sees all of them
+	if withClause := selectStatement.WithClause; withClause != nil {
+		remapper.traceTreeTraversal("WITH CTE's", indentLevel)
 		cteNames := make(Set[string])
-		for _, cte := range selectStatement.WithClause.Ctes {
-			cteNames.Add(cte.GetCommonTableExpr().Ctename)
-		}
 		remapper.cteNameScopes = append(remapper.cteNameScopes, cteNames)
 		defer func() { remapper.cteNameScopes = remapper.cteNameScopes[:len(remapper.cteNameScopes)-1] }()
+
+		if withClause.Recursive {
+			for _, cte := range withClause.Ctes {
+				cteNames.Add(cte.GetCommonTableExpr().Ctename)
+			}
+		}
+		for _, cte := range withClause.Ctes {
+			if cteSelect := cte.GetCommonTableExpr().Ctequery.GetSelectStmt(); cteSelect != nil {
+				remapper.remapSelectStatement(cteSelect, indentLevel+1) // self-recursion
+			}
+			cteNames.Add(cte.GetCommonTableExpr().Ctename)
+		}
 	}
 
 	// UNION
@@ -183,16 +202,6 @@ func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.Sel
 			selectStatement.WhereClause = nil
 		} else {
 			selectStatement.WhereClause = remapper.remappedExpressions(selectStatement.WhereClause, indentLevel) // recursion
-		}
-	}
-
-	// WITH
-	if selectStatement.WithClause != nil {
-		remapper.traceTreeTraversal("WITH CTE's", indentLevel)
-		for _, cte := range selectStatement.WithClause.Ctes {
-			if cteSelect := cte.GetCommonTableExpr().Ctequery.GetSelectStmt(); cteSelect != nil {
-				remapper.remapSelectStatement(cteSelect, indentLevel+1) // self-recursion
-			}
 		}
 	}
 
@@ -239,7 +248,7 @@ func (remapper *QueryRemapper) remapSelectStatement(selectStatement *pgQuery.Sel
 	remapper.remapSelect(selectStatement, indentLevel) // recursion
 }
 
-func (remapper *QueryRemapper) remapJoinExpressions(selectStatement *pgQuery.SelectStmt, node *pgQuery.Node, indentLevel int) *pgQuery.Node {
+func (remapper *QueryRemapperWalk) remapJoinExpressions(selectStatement *pgQuery.SelectStmt, node *pgQuery.Node, indentLevel int) *pgQuery.Node {
 	remapper.traceTreeTraversal("JOIN left", indentLevel)
 	leftJoinNode := node.GetJoinExpr().Larg
 	if leftJoinNode.GetJoinExpr() != nil {
@@ -305,7 +314,7 @@ func (remapper *QueryRemapper) remapJoinExpressions(selectStatement *pgQuery.Sel
 	return node
 }
 
-func (remapper *QueryRemapper) remappedExpressions(node *pgQuery.Node, indentLevel int) *pgQuery.Node {
+func (remapper *QueryRemapperWalk) remappedExpressions(node *pgQuery.Node, indentLevel int) *pgQuery.Node {
 	// CASE
 	caseExpression := node.GetCaseExpr()
 	if caseExpression != nil {
@@ -399,12 +408,12 @@ func (remapper *QueryRemapper) remappedExpressions(node *pgQuery.Node, indentLev
 	return remapper.remapperExpression.RemappedExpression(node)
 }
 
-// FROM/JOIN [TABLE] -> leave references to the query's own WITH names as is, without an Iceberg lookup
-func (remapper *QueryRemapper) remapTable(node *pgQuery.Node) *pgQuery.Node {
-	rangeVar := node.GetRangeVar()
-	if rangeVar.Schemaname == "" {
+// FROM/JOIN [TABLE] -> leave references to WITH names in scope as is, without an Iceberg lookup
+func (remapper *QueryRemapperWalk) remapTable(node *pgQuery.Node) *pgQuery.Node {
+	qSchemaTable := remapper.parserTable.NodeToQuerySchemaTable(node)
+	if qSchemaTable.Schema == "" { // A WITH name has no schema
 		for _, cteNames := range remapper.cteNameScopes {
-			if cteNames.Contains(rangeVar.Relname) {
+			if cteNames.Contains(qSchemaTable.Table) {
 				return node
 			}
 		}
@@ -415,7 +424,7 @@ func (remapper *QueryRemapper) remapTable(node *pgQuery.Node) *pgQuery.Node {
 
 // FROM/JOIN FUNCTION(args) -> remap the function call itself and the expressions in its args
 // (e.g. '...'::jsonb casts, schema.table.column references)
-func (remapper *QueryRemapper) remapTableFunction(rangeFunction *pgQuery.RangeFunction, indentLevel int) {
+func (remapper *QueryRemapperWalk) remapTableFunction(rangeFunction *pgQuery.RangeFunction, indentLevel int) {
 	remapper.remapperTable.RemapTableFunctionCall(rangeFunction)
 
 	for _, functionCall := range remapper.remapperTable.TableFunctionCalls(rangeFunction) {
@@ -428,7 +437,7 @@ func (remapper *QueryRemapper) remapTableFunction(rangeFunction *pgQuery.RangeFu
 }
 
 // CASE ...
-func (remapper *QueryRemapper) remapCaseExpression(caseExpr *pgQuery.CaseExpr, indentLevel int) {
+func (remapper *QueryRemapperWalk) remapCaseExpression(caseExpr *pgQuery.CaseExpr, indentLevel int) {
 	for _, when := range caseExpr.Args {
 		if whenClause := when.GetCaseWhen(); whenClause != nil {
 			// WHEN ...
@@ -450,7 +459,7 @@ func (remapper *QueryRemapper) remapCaseExpression(caseExpr *pgQuery.CaseExpr, i
 }
 
 // SELECT ...
-func (remapper *QueryRemapper) remapSelect(selectStatement *pgQuery.SelectStmt, indentLevel int) *pgQuery.SelectStmt {
+func (remapper *QueryRemapperWalk) remapSelect(selectStatement *pgQuery.SelectStmt, indentLevel int) *pgQuery.SelectStmt {
 	remapper.traceTreeTraversal("SELECT statements", indentLevel)
 
 	// SELECT ...

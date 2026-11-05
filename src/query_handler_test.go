@@ -1239,7 +1239,47 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {Uint32ToString(pgtype.Int8OID)},
 				"values":      {"2"},
 			},
+			"WITH test_table AS (SELECT id FROM test_table) SELECT COUNT(*) AS count FROM test_table": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"2"},
+			},
+			"WITH a AS (SELECT id FROM test_table), test_table AS (SELECT 99 AS id) SELECT MAX(id) AS max FROM a": {
+				"description": {"max"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"2"},
+			},
+			"WITH RECURSIVE test_table AS (SELECT 10 AS id UNION ALL SELECT id + 1 FROM test_table WHERE id < 12) SELECT MAX(id) AS max FROM test_table": {
+				"description": {"max"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"12"},
+			},
 		})
+	})
+
+	t.Run("WITH names skip the Iceberg table lookup", func(t *testing.T) {
+		// A lookup miss reloads the table list from storage, which drops this marker
+		remapperTable := queryHandler.queryRemapper.remapperTable
+		marker := IcebergSchemaTable{Schema: "public", Table: "reload_marker"}
+
+		for _, query := range []string{
+			"WITH a AS (SELECT 1 AS id), b AS (SELECT id FROM a) SELECT id FROM b",
+			"WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t WHERE n IN (SELECT n FROM t)",
+		} {
+			remapperTable.icebergSchemaTables.Add(marker)
+			_, _, err := queryHandler.queryRemapper.ParseAndRemapQuery(query)
+			testNoError(t, err)
+			if !remapperTable.icebergSchemaTables.Contains(marker) {
+				t.Errorf("Expected the WITH names not to reload the table list: %s", query)
+			}
+		}
+
+		// Control: an unknown table does reload it
+		_, _, err := queryHandler.queryRemapper.ParseAndRemapQuery("SELECT * FROM non_existent_table")
+		testNoError(t, err)
+		if remapperTable.icebergSchemaTables.Contains(marker) {
+			t.Errorf("Expected an unknown table to reload the table list")
+		}
 	})
 
 	t.Run("ORDER BY", func(t *testing.T) {
