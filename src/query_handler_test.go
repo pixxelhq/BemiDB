@@ -1254,6 +1254,16 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {Uint32ToString(pgtype.Int4OID)},
 				"values":      {"12"},
 			},
+			"SELECT COUNT(*) AS count FROM ((WITH test_table AS (SELECT 10 AS id) SELECT id FROM test_table) UNION ALL (SELECT id FROM test_table)) u": {
+				"description": {"count"},
+				"types":       {Uint32ToString(pgtype.Int8OID)},
+				"values":      {"3"},
+			},
+			"WITH test_table AS (SELECT 10 AS id) SELECT id FROM (WITH test_table AS (SELECT id + 1 AS id FROM test_table) SELECT id FROM test_table) s": {
+				"description": {"id"},
+				"types":       {Uint32ToString(pgtype.Int4OID)},
+				"values":      {"11"},
+			},
 		})
 	})
 
